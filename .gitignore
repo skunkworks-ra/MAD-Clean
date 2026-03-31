@@ -175,3 +175,8 @@ __marimo__/
 models/
 crumb_data/
 results/
+
+
+# Real observation data (CASA images, PNGs — use DVC or store separately)
+SNR_G55_10s.MultiScale_spw3.image/
+SNR_G55_10s.briggs.image.png
