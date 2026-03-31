@@ -35,8 +35,9 @@ fetch         = "python scripts/fetch_crumb.py"
 simulate      = "python scripts/simulate_observations.py --data crumb_data/crumb_preprocessed.npz --psf_fwhm 3.0 --noise_std 0.05 --out crumb_data/flow_pairs.npz"
 train-patch   = "python scripts/run_train.py --variant A --data crumb_data/flow_pairs.npz --out models/cdl_filters_patch.npy"
 train-conv    = "python scripts/run_train.py --variant B --data crumb_data/flow_pairs.npz --out models/cdl_filters_conv.npy --k 32 --atom_size 15"
-deconvolve-A  = "python scripts/run_deconvolve.py --variant A --dirty dirty.fits --psf psf.fits --atoms models/cdl_filters_patch.npy --out_dir results/"
-deconvolve-B  = "python scripts/run_deconvolve.py --variant B --dirty dirty.fits --psf psf.fits --atoms models/cdl_filters_conv.npy --out_dir results/"
+deconvolve-A      = "python scripts/run_deconvolve.py --variant A --dirty dirty.fits --psf psf.fits --atoms models/cdl_filters_patch.npy --out_dir results/"
+deconvolve-B      = "python scripts/run_deconvolve.py --variant B --dirty dirty.fits --psf psf.fits --atoms models/cdl_filters_conv.npy --out_dir results/"
+deconvolve-hogbom = "python scripts/run_deconvolve.py --variant hogbom --dirty dirty.fits --psf psf.fits --out_dir results/"
 test          = "python -m pytest tests/ -v"
 
 [tool.pixi.feature.gpu.tasks]

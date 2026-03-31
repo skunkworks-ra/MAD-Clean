@@ -28,6 +28,27 @@ from mad_clean.filters import FilterBank
 from mad_clean.detection import IslandDetector
 from mad_clean.solvers import PatchSolver, ConvSolver
 
+try:
+    from mad_clean.psf_utils import compute_psf_patch
+except (ImportError, ModuleNotFoundError):
+    from psf_utils import compute_psf_patch  # type: ignore[no-redef]
+
+
+def _clip_box(
+    py: int, px: int,
+    psf_cy: int, psf_cx: int,
+    psf_h: int, psf_w: int,
+    H: int, W: int,
+) -> tuple:
+    """Boundary-clipped residual and PSF regions for direct PSF subtraction."""
+    r0, r1 = py - psf_cy, py - psf_cy + psf_h
+    c0, c1 = px - psf_cx, px - psf_cx + psf_w
+    r0c, r1c = max(0, r0), min(H, r1)
+    c0c, c1c = max(0, c0), min(W, c1)
+    pr0 = r0c - r0;  pr1 = pr0 + (r1c - r0c)
+    pc0 = c0c - c0;  pc1 = pc0 + (c1c - c0c)
+    return r0c, r1c, c0c, c1c, pr0, pr1, pc0, pc1
+
 
 __all__ = ["MADClean"]
 
@@ -72,30 +93,35 @@ class MADClean:
 
     def __init__(
         self,
-        filter_bank  : FilterBank,
-        solver       : Union[PatchSolver, ConvSolver],
-        detector     : IslandDetector,
-        gamma        : float = 0.1,
-        epsilon_frac : float = 0.01,
-        n_max        : int   = 500,
-        device       : Union[str, torch.device] = "cpu",
-        verbose      : bool  = True,
+        filter_bank   : FilterBank,
+        solver        : Union[PatchSolver, ConvSolver],
+        detector      : Union[IslandDetector, None] = None,
+        gamma         : float = 0.1,
+        epsilon_frac  : float = 0.01,
+        n_max         : int   = 500,
+        device        : Union[str, torch.device] = "cpu",
+        verbose       : bool  = True,
+        refresh_every : int   = 100,
+        energy_frac   : float = 0.90,
     ):
-        self.fb           = filter_bank
-        self.solver       = solver
-        self.detector     = detector
-        self.gamma        = gamma
-        self.epsilon_frac = epsilon_frac
-        self.n_max        = n_max
-        self.device       = torch.device(device)
-        self.verbose      = verbose
+        self.fb            = filter_bank
+        self.solver        = solver
+        self.detector      = detector   # kept for API compatibility; unused in main loop
+        self.gamma         = gamma
+        self.epsilon_frac  = epsilon_frac
+        self.n_max         = n_max
+        self.device        = torch.device(device)
+        self.verbose       = verbose
+        self.refresh_every = refresh_every
+        self.energy_frac   = energy_frac
 
         self._variant_label = getattr(solver, "_variant_label",
                                        solver.__class__.__name__)
         if self.verbose:
             print(f"MADClean ready  variant={self._variant_label}  "
                   f"γ={gamma}  ε_frac={epsilon_frac}  "
-                  f"N_max={n_max}  device={self.device}")
+                  f"N_max={n_max}  refresh_every={refresh_every}  "
+                  f"device={self.device}")
 
     # ── PSF convolution ───────────────────────────────────────────────────────
 
@@ -162,65 +188,127 @@ class MADClean:
                 f"the same shape. Crop or pad the PSF to match."
             )
 
+        H, W = dirty_np.shape[-2], dirty_np.shape[-1]
+
         dirty_t  = torch.from_numpy(dirty_np).float().to(self.device)
         psf_t    = torch.from_numpy(psf_np  ).float().to(self.device)
-        psf_fft  = self._prepare_psf(psf_t)   # precomputed once
+
+        # Precompute FFT of reference PSF (2D) for periodic residual refresh.
+        psf_ref = psf_t if psf_t.ndim == 2 else psf_t.reshape(-1, H, W)[0]
+        psf_fft = self._prepare_psf(psf_ref)
+
+        # Precompute PSF patch for direct subtraction in the minor cycle.
+        psf_patch, (half_h, half_w) = compute_psf_patch(
+            psf_ref, energy_frac=self.energy_frac
+        )
+        cy_p, cx_p = psf_patch.shape[0] // 2, psf_patch.shape[1] // 2
 
         residual    = dirty_t.clone()
         model       = torch.zeros_like(dirty_t)
         _has_uncert = hasattr(self.solver, "decode_island_with_uncertainty")
         uncertainty = torch.zeros_like(model) if _has_uncert else None
 
-        rms_init  = float(residual.std())
-        epsilon   = self.epsilon_frac * rms_init
+        dirty_peak = float(dirty_t.abs().max())
+        rms_init   = float(residual.reshape(-1, H, W)[0].std()
+                          if residual.ndim > 2 else residual.std())
+
+        # Stopping threshold: 10% of dirty peak, or epsilon_frac × rms_init,
+        # whichever is larger.  10% of dirty peak is a robust, PSF-agnostic
+        # floor — safe for non-Gaussian PSF structures like the VLA.
+        epsilon_psf = 0.1 * dirty_peak
+        epsilon_rms = self.epsilon_frac * rms_init
+        epsilon     = max(epsilon_psf, epsilon_rms)
+
         rms_curve = [rms_init]
 
         if self.verbose:
-            print(f"  dirty peak={float(dirty_t.max()):.4e}  "
-                  f"initial RMS={rms_init:.4e}  ε={epsilon:.4e}")
+            print(f"  dirty peak={dirty_peak:.4e}  "
+                  f"initial RMS={rms_init:.4e}  "
+                  f"ε={epsilon:.4e}  "
+                  f"PSF patch={psf_patch.shape}")
 
-        # ── major cycle ───────────────────────────────────────────────────
+        # ── guide image: always 2D (first leading-dim slice) ─────────────
+        def _guide(r: torch.Tensor) -> torch.Tensor:
+            return r if r.ndim == 2 else r.reshape(-1, H, W)[0]
+
+        # ── FFT residual refresh (exact, runs every refresh_every steps) ─
+        def _fft_refresh(m: torch.Tensor) -> torch.Tensor:
+            if m.ndim == 2:
+                return dirty_t - self._convolve_psf(m, psf_fft)
+            n_slices = m.reshape(-1, H, W).shape[0]
+            slices = [
+                dirty_t.reshape(-1, H, W)[i] - self._convolve_psf(
+                    m.reshape(-1, H, W)[i], psf_fft
+                )
+                for i in range(n_slices)
+            ]
+            return torch.stack(slices).reshape(m.shape)
+
+        converged = False
+
+        # ── peak-driven minor cycle ───────────────────────────────────────
         for it in range(self.n_max):
+            guide = _guide(residual)
 
-            bboxes, rms = self.detector.detect(residual)
+            # Find peak in guide image
+            flat = int(guide.abs().argmax())
+            py   = flat // W
+            px   = flat % W
+            peak_v_guide = float(guide[py, px])
 
-            if not bboxes:
+            # Convergence check on guide peak
+            if abs(peak_v_guide) < epsilon:
+                converged = True
                 if self.verbose:
-                    print(f"  iter {it:3d}  no islands — stopping")
+                    print(f"  Converged iter {it}  "
+                          f"peak={peak_v_guide:.4e} < ε={epsilon:.4e}")
                 break
 
-            delta_m   = torch.zeros_like(model)
-            delta_unc = torch.zeros_like(model) if _has_uncert else None
-            for (r0, r1, c0, c1) in bboxes:
-                island = residual[r0:r1, c0:c1]
-                if _has_uncert:
-                    recon, std = self.solver.decode_island_with_uncertainty(island)
-                    delta_unc[r0:r1, c0:c1] += std
-                else:
-                    recon = self.solver.decode_island(island)
-                delta_m[r0:r1, c0:c1] += recon
+            # Island = PSF-patch-sized box centred at peak, clipped to image
+            r0 = max(0, py - half_h)
+            r1 = min(H, py + half_h + 1)
+            c0 = max(0, px - half_w)
+            c1 = min(W, px + half_w + 1)
+
+            # Solver input: 2D guide channel (current solvers are 2D-only).
+            # Leading-dim multi-channel support requires multi-dim solvers (future).
+            island_2d = residual[r0:r1, c0:c1] if residual.ndim == 2 \
+                        else residual.reshape(-1, H, W)[0, r0:r1, c0:c1]
 
             if _has_uncert:
-                uncertainty += self.gamma * delta_unc
+                model_patch, std = self.solver.decode_island_with_uncertainty(island_2d)
+                uncertainty[..., r0:r1, c0:c1] += self.gamma * std
+            else:
+                model_patch = self.solver.decode_island(island_2d)
 
-            model    += self.gamma * delta_m
-            residual  = dirty_t - self._convolve_psf(model, psf_fft)
-            rms_new   = float(residual.std())
-            rms_curve.append(rms_new)
+            # Update model (broadcast model_patch to all leading dims)
+            model[..., r0:r1, c0:c1] += self.gamma * model_patch
 
-            if self.verbose and (it + 1) % 50 == 0:
-                print(f"  iter {it+1:3d}  RMS={rms_new:.4e}  "
-                      f"islands={len(bboxes)}")
+            # Direct PSF subtract: peak(model_patch) × psf_patch (Hogbom-style)
+            peak_m = float(model_patch[py - r0, px - c0])
+            r0c, r1c, c0c, c1c, pr0, pr1, pc0, pc1 = _clip_box(
+                py, px, cy_p, cx_p, psf_patch.shape[0], psf_patch.shape[1], H, W
+            )
+            residual[..., r0c:r1c, c0c:c1c] -= (
+                self.gamma * peak_m * psf_patch[pr0:pr1, pc0:pc1]
+            )
 
-            if rms_new < epsilon:
+            # Periodic FFT residual refresh
+            if (it + 1) % self.refresh_every == 0:
+                residual = _fft_refresh(model)
+                rms_new  = float(_guide(residual).std())
+                rms_curve.append(rms_new)
                 if self.verbose:
-                    print(f"  Converged iter {it+1}  "
-                          f"RMS={rms_new:.4e} < ε={epsilon:.4e}")
-                break
+                    print(f"  iter {it+1:4d}  peak={peak_v_guide:.4e}  "
+                          f"RMS={rms_new:.4e}")
+
         else:
             if self.verbose:
                 print(f"  N_max={self.n_max} reached  "
-                      f"final RMS={rms_curve[-1]:.4e}")
+                      f"final peak={peak_v_guide:.4e}")
+
+        # Final exact residual
+        residual = _fft_refresh(model)
 
         # ── move outputs to CPU numpy ──────────────────────────────────────
         model_np    = model.cpu().numpy().astype(np.float32)
@@ -249,10 +337,13 @@ class MADClean:
             "residual"   : residual_np,
             "rms_curve"  : rms_arr,
             "n_iter"     : len(rms_curve) - 1,
+            "converged"  : converged,
+            "peak_flux"  : float(model.abs().max()),
             "uncertainty": uncert_np,
         }
 
     def __repr__(self) -> str:
         return (f"MADClean(solver={self.solver.__class__.__name__}, "
                 f"γ={self.gamma}, ε_frac={self.epsilon_frac}, "
-                f"N_max={self.n_max}, device={self.device})")
+                f"N_max={self.n_max}, refresh_every={self.refresh_every}, "
+                f"device={self.device})")

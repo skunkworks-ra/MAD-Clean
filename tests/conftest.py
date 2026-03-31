@@ -56,7 +56,9 @@ if "mad_clean" not in sys.modules:
         "conv_dict"  : "conv_dict.py",
         "flow_dict"  : "flow_dict.py",
         "solvers"    : "solvers.py",
+        "psf_utils"  : "psf_utils.py",   # must precede deconvolver and hogbom
         "deconvolver": "deconvolver.py",
+        "hogbom"     : "hogbom.py",
     }
     for _name, _file in _local_mods.items():
         _mod = _load_local(_name, _file)

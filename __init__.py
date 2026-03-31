@@ -34,6 +34,8 @@ from mad_clean.solvers     import PatchSolver, ConvSolver, FlowSolver
 from mad_clean.deconvolver import MADClean
 from mad_clean.io          import load_image, load_image_data, save_fits
 from mad_clean.flow_dict   import FlowModel, FlowTrainer
+from mad_clean.psf_utils   import compute_psf_patch
+from mad_clean.hogbom      import hogbom_clean
 
 __all__ = [
     "FilterBank",
@@ -47,6 +49,8 @@ __all__ = [
     "save_fits",
     "FlowModel",
     "FlowTrainer",
+    "compute_psf_patch",
+    "hogbom_clean",
 ]
 
 __version__ = "0.1.0"
