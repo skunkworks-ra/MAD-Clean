@@ -479,8 +479,54 @@ in favour of iterative dilation in PyTorch to keep the dependency list clean.
 | Atom size sweep for Variant B | Pending Variant A results | Use same F=15 initially |
 | Alpha sweep for Variant A | Deferred | After K results reviewed |
 | Full batched OMP | Deferred | Current: per-island loop, GPU matmul |
-| CASA/LibRA integration | Not started | Interface contract defined in §10 |
+| CASA/LibRA integration | Pinned — external module not ready | Interface contract defined in §10 |
 | Real data validation | Not started | Need dirty beam FITS from simobserve |
+
+---
+
+## 14. Variant C — Flow Matching Solver (planned 2026-03-30)
+
+See `bayesian_imaging.md` for full literature review and positioning.
+See `plan.md` §"Variant C" for the detailed implementation plan and TODO list.
+
+### 14.1 Scientific motivation
+
+All published Bayesian radio imaging methods (RESOLVE, IRIS, DDRM-radio, AIRI) operate at
+full-image scale. MAD-CLEAN's island decomposition enables **per-source posteriors**: the flow
+prior operates on an isolated source patch, yielding flux error bars and morphology confidence
+per source — the scientifically correct granularity for a source catalogue.
+
+### 14.2 Method
+
+```
+Prior:      p(source)          — CFM flow trained on CRUMB clean images (150×150)
+Likelihood: p(island | source) — Gaussian: island ≈ PSF ⊛ source + noise
+Posterior:  p(source | island) — sampled via guided Euler ODE (DPS-style)
+```
+
+The flow is trained on clean images only. The PSF enters exclusively in the likelihood
+at inference — never in the learned component. Generalisation guarantee preserved.
+
+### 14.3 New components
+
+| Component | File | Notes |
+|---|---|---|
+| `UNetVelocityField` | `train/flow_dict.py` | ~2–4M param U-Net, pure PyTorch |
+| `FlowModel` | `train/flow_dict.py` | wrapper, saves as `.pt` state dict |
+| `FlowTrainer` | `train/flow_dict.py` | CFM training, 8-fold augmentation |
+| `FlowSolver` | `solvers.py` | drops into MADClean solver slot |
+
+### 14.4 Key interface extension
+
+`FlowSolver` adds `decode_island_with_uncertainty(island) → (mean, std)`.
+`MADClean.deconvolve()` returns `result["uncertainty"]` when solver supports it.
+All existing solver behaviour (A, B) unchanged — duck-typed, backward compatible.
+
+### 14.5 Literature gap
+
+No published method applies Lipman et al. conditional flow matching to radio interferometric
+imaging as of March 2026. No published method does island-level Bayesian posterior estimation.
+Both are simultaneous novelty axes. See `bayesian_imaging.md` §7–8.
 
 ---
 

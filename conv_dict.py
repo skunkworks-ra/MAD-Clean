@@ -99,6 +99,12 @@ class ConvDictTrainer:
         K, F = self.k, self.atom_size
         N, H, W = images.shape
 
+        # Per-image normalise: zero mean, unit variance — same as PatchDictTrainer.
+        # Without this, MSE is dominated by background zeros and atoms learn nothing.
+        img_mean = images.mean(axis=(1, 2), keepdims=True)
+        img_std  = images.std(axis=(1, 2), keepdims=True) + 1e-8
+        images   = (images - img_mean) / img_std
+
         print(f"ConvDictTrainer: K={K}  F={F}  images={N}×{H}×{W}  "
               f"batch={self.batch_size}  epochs={self.n_epochs}  device={dev}")
 
@@ -167,8 +173,8 @@ class ConvDictTrainer:
                 n_batches  += 1
 
             print(f"  Epoch {epoch + 1:3d}/{self.n_epochs}  "
-                  f"loss={epoch_loss / n_batches:.6f}  "
-                  f"sparsity={epoch_spar / n_batches:.3f}")
+                  f"loss={epoch_loss / n_batches:.3e}  "
+                  f"sparsity={epoch_spar / n_batches:.4f}")
 
         # ── build final FilterBank ────────────────────────────────────────────
         fb     = FilterBank(D.detach().cpu().numpy(), device=device)

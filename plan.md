@@ -1,13 +1,154 @@
 # MAD-CLEAN Implementation Plan
 
-**Last updated:** 2026-03-14  
-**Context note:** This document exists to restore full working context in a new
-session. Read DESIGN.md first, then this document. Together they are sufficient
-to resume implementation without re-deriving anything.
+**Last updated:** 2026-03-30
+**Context note:** Read `design.md` first, then `bayesian_imaging.md` for literature context, then this document.
 
 ---
 
-## Current Status Summary
+## Variant C — Flow Matching Solver (approved 2026-03-30)
+
+See `bayesian_imaging.md` for literature positioning. Key novelty: island-level flow matching prior — no published method does this. No published method applies Lipman et al. CFM to radio imaging.
+
+### New files
+
+**`train/flow_dict.py`** — three classes:
+
+- **`UNetVelocityField(nn.Module)`**: lightweight U-Net (~2–4M params), input `(B,1,150,150)` + time embedding, output `(B,1,150,150)` velocity field. Pure PyTorch, no new dependencies.
+- **`FlowModel`**: thin wrapper. `save(path)` → `.pt` state dict. `load(path, device)`. `velocity(x, t) → Tensor`.
+- **`FlowTrainer`**: `fit(images: np.ndarray, device) → FlowModel`. Per-image normalisation (zero mean, unit std, consistent with ConvDictTrainer). 8-fold on-the-fly augmentation (4 rotations + flip). CFM loss with OT paths: `loss = ||v_θ(xt,t) - (x1-x0)||²`. Adam lr=1e-4.
+
+### Modified files
+
+**`solvers.py`** — add `FlowSolver`:
+- `__init__(flow_model, psf, device, n_samples=8, n_steps=16, guidance_scale=1.0)`
+- PSF passed at construction; `psf_fft` precomputed internally
+- `decode_island(island) → Tensor` — posterior mean, backward compatible with MADClean
+- `decode_island_with_uncertainty(island) → (mean, std)` — both `(H_i, W_i)`
+- Island zero-padded to 150×150, cropped back per sample
+- Guided Euler ODE (t: 1→0): `x1hat = xt + (1-t)*v`; guidance = `PSF^T(y - PSF⊛x1hat)/σ²`; σ from `island.std()`
+
+**`deconvolver.py`** — two minimal changes:
+1. Duck-typed uncertainty accumulation: `hasattr(solver, 'decode_island_with_uncertainty')`; adds `"uncertainty": ndarray|None` to return dict
+2. Variant label: `getattr(solver, '_variant_label', cls.__name__)`; FlowSolver sets `_variant_label = "C/Flow"`
+
+**`scripts/run_train.py`** — `--variant C` branch
+
+**`__init__.py`** — export `FlowSolver`, `FlowTrainer`, `FlowModel`
+
+### What does NOT change
+`MADClean.__init__` signature, `IslandDetector`, `FilterBank`, `PatchSolver`, `ConvSolver`, outer CLEAN loop.
+
+### Build sequence
+1. `UNetVelocityField` → `FlowModel` → `FlowTrainer` (in `train/flow_dict.py`)
+2. `FlowSolver` (in `solvers.py`)
+3. `deconvolver.py` patch
+4. `scripts/run_train.py` variant C branch
+5. `__init__.py` exports
+
+### Verification
+```bash
+# Smoke-test training
+python scripts/run_train.py --variant C \
+    --data crumb_data/crumb_preprocessed.npz \
+    --out models/flow_model.pt --n_epochs 2 --batch_size 4
+
+# Velocity field shape check
+python -c "
+from train.flow_dict import FlowModel; import torch
+fm = FlowModel.load('models/flow_model.pt', device='cpu')
+v = fm.velocity(torch.randn(1,1,150,150), torch.tensor([0.5]))
+print(v.shape)  # torch.Size([1, 1, 150, 150])
+"
+
+# FlowSolver uncertainty check
+python -c "
+import torch, numpy as np
+from train.flow_dict import FlowModel; from solvers import FlowSolver
+fm = FlowModel.load('models/flow_model.pt', device='cpu')
+psf = np.zeros((150,150), dtype=np.float32); psf[75,75] = 1.0
+s = FlowSolver(fm, psf, 'cpu', n_samples=2, n_steps=4)
+mean, std = s.decode_island_with_uncertainty(torch.randn(40,35))
+assert mean.shape == (40,35) and std.shape == (40,35)
+print('OK')
+"
+```
+
+---
+
+## TODO — Variant C
+
+- [x] **C-1** `UNetVelocityField` — encoder/bottleneck/decoder with skip connections, sinusoidal time embedding
+- [x] **C-2** `FlowModel` — wrapper with `save`/`load`/`velocity`
+- [x] **C-3** `FlowTrainer.fit()` — CFM training loop with 8-fold augmentation
+- [x] **C-4** `FlowSolver.__init__` — PSF FFT precomputation, hyperparams
+- [x] **C-5** `FlowSolver.decode_island_with_uncertainty` — guided Euler ODE, pad/crop, n_samples
+- [x] **C-6** `FlowSolver.decode_island` — calls `decode_island_with_uncertainty`, returns mean
+- [x] **C-7** `deconvolver.py` — uncertainty accumulation + variant label
+- [x] **C-8** `scripts/run_train.py` — `--variant C` branch
+- [x] **C-9** `__init__.py` — exports
+- [x] **C-10** Smoke test training (2 epochs, GPU) — loss decreased 0.127 → 0.074
+- [x] **C-11** Smoke test FlowSolver — shape assertions pass
+- [x] **C-12** Full deconvolution run — `result['uncertainty']` is not None
+
+---
+
+## Variant C — Refactor: Conditional Flow Matching (approved 2026-03-30)
+
+**Problem with initial implementation:** FlowTrainer trained on noise→clean (x_0 ~ N(0,I)).
+FlowSolver required a PSF internally for data-consistency guidance. This is architecturally
+inconsistent with Variants A/B where the PSF lives entirely in the outer CLEAN loop.
+
+**Solution:** Conditional flow matching — train dirty→clean directly.
+- x_0 = dirty island, x_1 = clean island (naturally paired, no OT needed)
+- Velocity field v_θ learns the mapping dirty→clean
+- FlowSolver: Euler ODE starts from dirty island, no PSF required
+- Uncertainty: perturb x_0 = dirty + ε·N(0,I) per sample
+
+### Unified data pipeline
+
+```
+crumb_preprocessed.npz  +  PSF (FITS/npy or --psf_fwhm Gaussian)
+         ↓
+scripts/simulate_observations.py
+         ↓
+flow_pairs.npz  { clean: (N,H,W), dirty: (N,H,W), psf: (H,W), noise_std: float }
+         ↓
+scripts/run_train.py --variant [A|B|C] --data flow_pairs.npz
+```
+
+- **A**: loads `data["clean"]` → PatchDictTrainer (unchanged)
+- **B**: loads `data["clean"]` → ConvDictTrainer (unchanged)
+- **C**: loads `data["dirty"]` + `data["clean"]` → FlowTrainer
+
+### What changes
+
+| File | Change |
+|---|---|
+| `scripts/simulate_observations.py` | **new** — PSF conv + noise → saves clean/dirty/psf/noise_std |
+| `flow_dict.py` | `FlowTrainer.fit(dirty, clean, device)` — remove OT pairing; normalise by clean stats |
+| `solvers.py` | `FlowSolver.__init__` — remove PSF; `decode_island` — Euler ODE from dirty island |
+| `scripts/run_train.py` | load correct key(s) per variant; `--variant C` takes `--pairs` npz |
+| `scripts/smoke_test_flow.py` | update for new interface |
+| `pyproject.toml` | update `train-flow-gpu` task |
+
+### What does NOT change
+`UNetVelocityField`, `FlowModel`, `deconvolver.py`, `__init__.py`, Variants A/B trainers.
+
+### TODO — Variant C refactor
+
+- [ ] **CR-1** `scripts/simulate_observations.py` — PSF convolution + noise, output npz
+- [ ] **CR-2** `FlowTrainer.fit(dirty, clean, device)` — dirty→clean CFM, remove OT pairing
+- [ ] **CR-3** `FlowSolver` — remove PSF, Euler ODE from dirty island, perturb for uncertainty
+- [ ] **CR-4** `scripts/run_train.py` — load clean/dirty keys per variant
+- [ ] **CR-5** `pyproject.toml` — update `train-flow-gpu` task
+- [ ] **CR-6** `scripts/smoke_test_flow.py` — update for new interface
+- [ ] **CR-7** Smoke test: `simulate_observations.py` produces valid npz
+- [ ] **CR-8** Smoke test: `run_train.py --variant C` loss decreases on dirty→clean
+- [ ] **CR-9** Smoke test: `FlowSolver.decode_island` returns (H_i, W_i) without PSF
+
+---
+
+## Current Status Summary (Variants A and B)
 
 | Component | Status | Notes |
 |---|---|---|

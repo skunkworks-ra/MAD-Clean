@@ -30,19 +30,23 @@ Quick start
 
 from mad_clean.filters     import FilterBank
 from mad_clean.detection   import IslandDetector
-from mad_clean.solvers     import PatchSolver, ConvSolver
+from mad_clean.solvers     import PatchSolver, ConvSolver, FlowSolver
 from mad_clean.deconvolver import MADClean
 from mad_clean.io          import load_image, load_image_data, save_fits
+from mad_clean.flow_dict   import FlowModel, FlowTrainer
 
 __all__ = [
     "FilterBank",
     "IslandDetector",
     "PatchSolver",
     "ConvSolver",
+    "FlowSolver",
     "MADClean",
     "load_image",
     "load_image_data",
     "save_fits",
+    "FlowModel",
+    "FlowTrainer",
 ]
 
 __version__ = "0.1.0"

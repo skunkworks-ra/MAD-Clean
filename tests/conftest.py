@@ -54,6 +54,7 @@ if "mad_clean" not in sys.modules:
         "io"         : "io.py",
         "patch_dict" : "patch_dict.py",
         "conv_dict"  : "conv_dict.py",
+        "flow_dict"  : "flow_dict.py",
         "solvers"    : "solvers.py",
         "deconvolver": "deconvolver.py",
     }

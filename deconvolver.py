@@ -90,10 +90,10 @@ class MADClean:
         self.device       = torch.device(device)
         self.verbose      = verbose
 
-        variant = ("A/Patch" if isinstance(solver, PatchSolver)
-                   else "B/Conv")
+        self._variant_label = getattr(solver, "_variant_label",
+                                       solver.__class__.__name__)
         if self.verbose:
-            print(f"MADClean ready  variant={variant}  "
+            print(f"MADClean ready  variant={self._variant_label}  "
                   f"γ={gamma}  ε_frac={epsilon_frac}  "
                   f"N_max={n_max}  device={self.device}")
 
@@ -166,8 +166,10 @@ class MADClean:
         psf_t    = torch.from_numpy(psf_np  ).float().to(self.device)
         psf_fft  = self._prepare_psf(psf_t)   # precomputed once
 
-        residual = dirty_t.clone()
-        model    = torch.zeros_like(dirty_t)
+        residual    = dirty_t.clone()
+        model       = torch.zeros_like(dirty_t)
+        _has_uncert = hasattr(self.solver, "decode_island_with_uncertainty")
+        uncertainty = torch.zeros_like(model) if _has_uncert else None
 
         rms_init  = float(residual.std())
         epsilon   = self.epsilon_frac * rms_init
@@ -187,11 +189,19 @@ class MADClean:
                     print(f"  iter {it:3d}  no islands — stopping")
                 break
 
-            delta_m = torch.zeros_like(model)
+            delta_m   = torch.zeros_like(model)
+            delta_unc = torch.zeros_like(model) if _has_uncert else None
             for (r0, r1, c0, c1) in bboxes:
                 island = residual[r0:r1, c0:c1]
-                recon  = self.solver.decode_island(island)
+                if _has_uncert:
+                    recon, std = self.solver.decode_island_with_uncertainty(island)
+                    delta_unc[r0:r1, c0:c1] += std
+                else:
+                    recon = self.solver.decode_island(island)
                 delta_m[r0:r1, c0:c1] += recon
+
+            if _has_uncert:
+                uncertainty += self.gamma * delta_unc
 
             model    += self.gamma * delta_m
             residual  = dirty_t - self._convolve_psf(model, psf_fft)
@@ -216,24 +226,30 @@ class MADClean:
         model_np    = model.cpu().numpy().astype(np.float32)
         residual_np = residual.cpu().numpy().astype(np.float32)
         rms_arr     = np.array(rms_curve, dtype=np.float32)
+        uncert_np   = (uncertainty.cpu().numpy().astype(np.float32)
+                       if uncertainty is not None else None)
 
         # ── optional FITS output ───────────────────────────────────────────
         if out_dir is not None:
             out_dir = Path(out_dir)
-            variant = ("A" if isinstance(self.solver, PatchSolver) else "B")
-            save_fits(model_np,    out_dir / f"mad_clean_{variant}_model.fits",
+            lbl = self._variant_label.replace("/", "_")
+            save_fits(model_np,    out_dir / f"mad_clean_{lbl}_model.fits",
                       header=psf_header)
-            save_fits(residual_np, out_dir / f"mad_clean_{variant}_residual.fits",
+            save_fits(residual_np, out_dir / f"mad_clean_{lbl}_residual.fits",
                       header=psf_header)
-            np.save(out_dir / f"mad_clean_{variant}_rms_curve.npy", rms_arr)
+            np.save(out_dir / f"mad_clean_{lbl}_rms_curve.npy", rms_arr)
+            if uncert_np is not None:
+                save_fits(uncert_np, out_dir / f"mad_clean_{lbl}_uncertainty.fits",
+                          header=psf_header)
             if self.verbose:
                 print(f"  Outputs written → {out_dir}/")
 
         return {
-            "model"    : model_np,
-            "residual" : residual_np,
-            "rms_curve": rms_arr,
-            "n_iter"   : len(rms_curve) - 1,
+            "model"      : model_np,
+            "residual"   : residual_np,
+            "rms_curve"  : rms_arr,
+            "n_iter"     : len(rms_curve) - 1,
+            "uncertainty": uncert_np,
         }
 
     def __repr__(self) -> str:
