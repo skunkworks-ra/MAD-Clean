@@ -5,6 +5,20 @@ description     = "Morphological Atom Decomposition CLEAN — learned sparse-cod
 readme          = "README.md"
 requires-python = ">=3.11"
 
+[build-system]
+requires      = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["mad_clean*"]
+
+[project.scripts]
+mad-train      = "scripts.train:main"
+mad-deconvolve = "scripts.deconvolve:main"
+mad-simulate   = "scripts.simulate:main"
+mad-eval       = "scripts.eval:main"
+
 [tool.pixi.project]
 channels  = ["pytorch", "conda-forge"]
 platforms = ["linux-64"]
@@ -30,17 +44,20 @@ pytorch-cuda = {version = ">=12.1", channel = "pytorch"}
 default = {features = ["cpu"], solve-group = "cpu"}
 gpu     = {features = ["gpu"], solve-group = "gpu"}
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.pixi.tasks]
 fetch         = "python scripts/fetch_crumb.py"
-simulate      = "python scripts/simulate_observations.py --data crumb_data/crumb_preprocessed.npz --psf_fwhm 3.0 --noise_std 0.05 --out crumb_data/flow_pairs.npz"
-train-patch   = "python scripts/run_train.py --variant A --data crumb_data/flow_pairs.npz --out models/cdl_filters_patch.npy"
-train-conv    = "python scripts/run_train.py --variant B --data crumb_data/flow_pairs.npz --out models/cdl_filters_conv.npy --k 32 --atom_size 15"
-deconvolve-A      = "python scripts/run_deconvolve.py --variant A --dirty dirty.fits --psf psf.fits --atoms models/cdl_filters_patch.npy --out_dir results/"
-deconvolve-B      = "python scripts/run_deconvolve.py --variant B --dirty dirty.fits --psf psf.fits --atoms models/cdl_filters_conv.npy --out_dir results/"
-deconvolve-hogbom = "python scripts/run_deconvolve.py --variant hogbom --dirty dirty.fits --psf psf.fits --out_dir results/"
+simulate      = "python scripts/simulate.py --data crumb_data/crumb_preprocessed.npz --psf_fwhm 3.0 --noise_std 0.05 --out crumb_data/flow_pairs.npz"
+train-patch   = "python scripts/train.py --variant A --data crumb_data/flow_pairs.npz --out models/cdl_filters_patch"
+train-conv    = "python scripts/train.py --variant B --data crumb_data/flow_pairs.npz --out models/cdl_filters_conv --k 32 --atom_size 15"
+deconvolve-A      = "python scripts/deconvolve.py --variant A --dirty dirty.fits --psf psf.fits --atoms models/cdl_filters_patch.npz --out_dir results/"
+deconvolve-B      = "python scripts/deconvolve.py --variant B --dirty dirty.fits --psf psf.fits --atoms models/cdl_filters_conv.npz --out_dir results/"
+deconvolve-hogbom = "python scripts/deconvolve.py --variant hogbom --dirty dirty.fits --psf psf.fits --out_dir results/"
 test          = "python -m pytest tests/ -v"
 
 [tool.pixi.feature.gpu.tasks]
-train-patch-gpu = "python scripts/run_train.py --variant A --data crumb_data/flow_pairs.npz --out models/cdl_filters_patch.npy --k 128 --lmbda 0.5 --n_epochs 50 --patches_per_img 50 --device cuda"
-train-conv-gpu  = "python scripts/run_train.py --variant B --data crumb_data/flow_pairs.npz --out models/cdl_filters_conv.npy --k 128 --lmbda 0.1 --n_epochs 50 --device cuda"
-train-flow-gpu  = "python scripts/run_train.py --variant C --data crumb_data/flow_pairs.npz --out models/flow_model.pt --n_epochs 100 --batch_size 8 --lr 1e-4 --device cuda"
+train-patch-gpu = "python scripts/train.py --variant A --data crumb_data/flow_pairs.npz --out models/cdl_filters_patch --k 128 --lmbda 0.5 --n_epochs 50 --patches_per_img 50 --device cuda"
+train-conv-gpu  = "python scripts/train.py --variant B --data crumb_data/flow_pairs.npz --out models/cdl_filters_conv --k 128 --lmbda 0.1 --n_epochs 50 --device cuda"
+train-flow-gpu  = "python scripts/train.py --variant C --data crumb_data/flow_pairs.npz --out models/flow_model.pt --n_epochs 100 --batch_size 8 --lr 1e-4 --device cuda"

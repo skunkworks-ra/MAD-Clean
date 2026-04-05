@@ -1,0 +1,181 @@
+"""
+mad_clean.data.simulate
+=======================
+SimulateObservations — simulate dirty radio observations from clean sky images.
+
+Applies a PSF (point spread function) to each clean image via FFT convolution
+and adds Gaussian noise. Produces a unified training npz usable by all variants:
+
+    Variant A:   use data["clean"]
+    Variant B:   use data["dirty"] + data["psf"]
+    Variant C:   use data["dirty"] + data["clean"]
+
+Usage
+-----
+    sim = SimulateObservations(psf_fwhm=3.0, noise_std=0.05)
+    sim.run("crumb_data/crumb_preprocessed.npz", out="crumb_data/flow_pairs.npz")
+
+    # Or with a real PSF file:
+    sim = SimulateObservations(psf_path="models/psf.fits", noise_std=0.05)
+    sim.run("crumb_data/crumb_preprocessed.npz", out="crumb_data/flow_pairs.npz")
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+__all__ = ["SimulateObservations"]
+
+
+def _make_gaussian_psf(fwhm: float, size: int) -> np.ndarray:
+    """
+    Build a 2D Gaussian PSF of given FWHM (pixels), centred at (size//2, size//2).
+    Peak-normalised to 1.0 (CASA convention: dirty ≈ PSF-blurred clean).
+    """
+    sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    cy, cx = size // 2, size // 2
+    ys = np.arange(size, dtype=np.float32) - cy
+    xs = np.arange(size, dtype=np.float32) - cx
+    yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    psf = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2)).astype(np.float32)
+    psf /= psf.max()
+    return psf
+
+
+def _load_psf(path: str | Path, target_shape: tuple) -> np.ndarray:
+    """
+    Load PSF from .npz, .npy, or FITS file. Crop or pad to target_shape (H, W).
+    Peak-normalised to 1.0 (CASA convention).
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".npz":
+        data = np.load(path)["psf"].astype(np.float32)
+    elif path.suffix.lower() == ".npy":
+        data = np.load(path).astype(np.float32)
+    elif path.suffix.lower() in (".fits", ".fit"):
+        from astropy.io import fits
+        with fits.open(path) as hdul:
+            data = hdul[0].data.astype(np.float32)
+            while data.ndim > 2:
+                data = data[0]
+    else:
+        raise ValueError(f"Unsupported PSF format: {path.suffix} — use .npz, .npy, or .fits")
+
+    H, W = target_shape
+    h, w = data.shape
+
+    if h > H or w > W:
+        ch = (h - H) // 2
+        cw = (w - W) // 2
+        data = data[ch:ch + H, cw:cw + W]
+
+    if data.shape != (H, W):
+        out = np.zeros((H, W), dtype=np.float32)
+        ph = (H - data.shape[0]) // 2
+        pw = (W - data.shape[1]) // 2
+        out[ph:ph + data.shape[0], pw:pw + data.shape[1]] = data
+        data = out
+
+    peak = data.max()
+    if peak > 1e-12:
+        data /= peak
+    return data
+
+
+def _convolve_psf(images: np.ndarray, psf: np.ndarray) -> np.ndarray:
+    """
+    Convolve each image in (N, H, W) with the PSF (H, W) via FFT.
+
+    The PSF peak is at (H//2, W//2). ifftshift moves it to (0, 0) before FFT
+    so the convolution is non-circular — consistent with MADClean's convention.
+    """
+    H, W = images.shape[1], images.shape[2]
+    psf_shifted = np.fft.ifftshift(psf)
+    psf_fft     = np.fft.rfft2(psf_shifted, s=(H, W))
+    imgs_fft    = np.fft.rfft2(images, axes=(1, 2))
+    dirty_fft   = imgs_fft * psf_fft[None, :, :]
+    dirty       = np.fft.irfft2(dirty_fft, s=(H, W), axes=(1, 2))
+    return dirty.astype(np.float32)
+
+
+class SimulateObservations:
+    """
+    Simulate dirty radio observations from clean sky images.
+
+    Parameters
+    ----------
+    psf_fwhm  : float | None   Synthetic Gaussian PSF FWHM in pixels.
+                               Mutually exclusive with psf_path.
+    psf_path  : str | Path | None  Real PSF file (.fits, .npy, or .npz).
+                               Mutually exclusive with psf_fwhm.
+    noise_std : float          Gaussian noise std in normalised units (default 0.05)
+    seed      : int            RNG seed (default 42)
+    """
+
+    def __init__(
+        self,
+        psf_fwhm  : float | None       = None,
+        psf_path  : str | Path | None  = None,
+        noise_std : float              = 0.05,
+        seed      : int                = 42,
+    ):
+        if psf_fwhm is None and psf_path is None:
+            raise ValueError("Provide either psf_fwhm or psf_path")
+        if psf_fwhm is not None and psf_path is not None:
+            raise ValueError("psf_fwhm and psf_path are mutually exclusive")
+
+        self.psf_fwhm  = psf_fwhm
+        self.psf_path  = Path(psf_path) if psf_path is not None else None
+        self.noise_std = noise_std
+        self.seed      = seed
+
+    def run(self, data_path: str | Path, out: str | Path) -> None:
+        """
+        Load clean images from data_path, simulate dirty images, save to out.
+
+        Parameters
+        ----------
+        data_path : path to .npz with 'images' key — (N, H, W) float32
+        out       : output .npz path — keys: clean, dirty, psf, noise_std
+        """
+        data_path = Path(data_path)
+        out_path  = Path(out)
+
+        raw    = np.load(data_path)
+        clean  = raw["images"].astype(np.float32)
+        N, H, W = clean.shape
+        print(f"Loaded {N} clean images  shape={H}×{W}")
+
+        img_mean = clean.mean(axis=(1, 2), keepdims=True)
+        img_std  = clean.std(axis=(1, 2),  keepdims=True) + 1e-8
+        clean_n  = (clean - img_mean) / img_std
+
+        if self.psf_fwhm is not None:
+            psf = _make_gaussian_psf(self.psf_fwhm, size=max(H, W))
+            psf = psf[:H, :W]
+            print(f"Synthetic Gaussian PSF  FWHM={self.psf_fwhm}px  shape={psf.shape}")
+        else:
+            psf = _load_psf(self.psf_path, target_shape=(H, W))
+            print(f"Loaded PSF from {self.psf_path}  shape={psf.shape}")
+
+        dirty_n = _convolve_psf(clean_n, psf)
+
+        rng      = np.random.default_rng(self.seed)
+        noise    = rng.standard_normal(dirty_n.shape).astype(np.float32) * self.noise_std
+        dirty_n += noise
+
+        print(f"Dirty images  noise_std={self.noise_std}  "
+              f"dirty range=[{dirty_n.min():.3f}, {dirty_n.max():.3f}]  "
+              f"clean range=[{clean_n.min():.3f}, {clean_n.max():.3f}]")
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            out_path,
+            clean     = clean_n,
+            dirty     = dirty_n,
+            psf       = psf,
+            noise_std = np.float32(self.noise_std),
+        )
+        print(f"Saved → {out_path}  keys: clean {clean_n.shape}, dirty {dirty_n.shape}, psf {psf.shape}")

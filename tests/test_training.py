@@ -9,11 +9,22 @@ import numpy as np
 import pytest
 
 from mad_clean.filters    import FilterBank
-from mad_clean.patch_dict import PatchDictTrainer
-from mad_clean.conv_dict  import ConvDictTrainer
+from mad_clean.training import PatchDictTrainer, ConvDictTrainer
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def _gaussian_psf(h: int = 40, w: int = 40, fwhm: float = 3.0) -> np.ndarray:
+    """Synthetic Gaussian PSF, peak-normalised to 1.0."""
+    import math
+    sigma = fwhm / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+    cy, cx = h // 2, w // 2
+    ys = np.arange(h, dtype=np.float32) - cy
+    xs = np.arange(w, dtype=np.float32) - cx
+    yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    psf = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2)).astype(np.float32)
+    return psf / psf.max()
+
 
 def _synthetic_images(
     n: int = 12,
@@ -47,7 +58,7 @@ def _synthetic_images(
 def test_patch_trainer_returns_filterbank():
     """PatchDictTrainer.fit() returns a FilterBank instance."""
     imgs    = _synthetic_images(n=10)
-    trainer = PatchDictTrainer(k=4, atom_size=5, n_iter=5, patches_per_img=5)
+    trainer = PatchDictTrainer(k=4, atom_size=5, n_epochs=5, patches_per_img=5)
     fb      = trainer.fit(imgs, device="cpu")
     assert isinstance(fb, FilterBank)
 
@@ -56,7 +67,7 @@ def test_patch_trainer_filterbank_shape():
     """Returned FilterBank has correct K and F."""
     k, f    = 6, 5
     imgs    = _synthetic_images(n=10)
-    trainer = PatchDictTrainer(k=k, atom_size=f, n_iter=5, patches_per_img=5)
+    trainer = PatchDictTrainer(k=k, atom_size=f, n_epochs=5, patches_per_img=5)
     fb      = trainer.fit(imgs, device="cpu")
     assert fb.K == k
     assert fb.F == f
@@ -65,18 +76,18 @@ def test_patch_trainer_filterbank_shape():
 def test_patch_trainer_atoms_normalised():
     """Atoms returned by PatchDictTrainer are unit L2 norm."""
     imgs    = _synthetic_images(n=10)
-    trainer = PatchDictTrainer(k=4, atom_size=5, n_iter=5, patches_per_img=5)
+    trainer = PatchDictTrainer(k=4, atom_size=5, n_epochs=5, patches_per_img=5)
     fb      = trainer.fit(imgs, device="cpu")
     norms   = fb.atoms.reshape(fb.K, -1).norm(dim=1)
     np.testing.assert_allclose(norms.numpy(), np.ones(fb.K), atol=1e-5)
 
 
 def test_patch_trainer_save(tmp_path):
-    """PatchDictTrainer.save() writes a .npy file that can be loaded."""
+    """PatchDictTrainer.save() writes a .npz file that can be loaded."""
     imgs    = _synthetic_images(n=8)
-    trainer = PatchDictTrainer(k=4, atom_size=5, n_iter=3, patches_per_img=3)
+    trainer = PatchDictTrainer(k=4, atom_size=5, n_epochs=3, patches_per_img=3)
     fb      = trainer.fit(imgs, device="cpu")
-    path    = tmp_path / "patch_atoms.npy"
+    path    = tmp_path / "patch_atoms.npz"
     trainer.save(path, fb)
     assert path.exists()
     fb2 = FilterBank.load(path)
@@ -87,48 +98,48 @@ def test_patch_trainer_save(tmp_path):
 
 def test_conv_trainer_returns_filterbank():
     """ConvDictTrainer.fit() returns a FilterBank instance."""
-    imgs    = _synthetic_images(n=10)
+    dirty   = _synthetic_images(n=10)
+    psf     = _gaussian_psf(dirty.shape[1], dirty.shape[2])
     trainer = ConvDictTrainer(k=4, atom_size=5, batch_size=4, n_epochs=2,
                                fista_iter_train=5)
-    fb      = trainer.fit(imgs, device="cpu")
+    fb      = trainer.fit(dirty, psf, device="cpu")
     assert isinstance(fb, FilterBank)
 
 
 def test_conv_trainer_filterbank_shape():
     """Returned FilterBank has the requested K and F."""
     k, f    = 6, 5
-    imgs    = _synthetic_images(n=10)
+    dirty   = _synthetic_images(n=10)
+    psf     = _gaussian_psf(dirty.shape[1], dirty.shape[2])
     trainer = ConvDictTrainer(k=k, atom_size=f, batch_size=4, n_epochs=2,
                                fista_iter_train=5)
-    fb      = trainer.fit(imgs, device="cpu")
+    fb      = trainer.fit(dirty, psf, device="cpu")
     assert fb.K == k
     assert fb.F == f
 
 
 def test_conv_trainer_atoms_normalised():
     """Atoms returned by ConvDictTrainer are unit L2 norm (unit-ball projection)."""
-    imgs    = _synthetic_images(n=8)
+    dirty   = _synthetic_images(n=8)
+    psf     = _gaussian_psf(dirty.shape[1], dirty.shape[2])
     trainer = ConvDictTrainer(k=4, atom_size=5, batch_size=4, n_epochs=2,
                                fista_iter_train=5)
-    fb      = trainer.fit(imgs, device="cpu")
+    fb      = trainer.fit(dirty, psf, device="cpu")
     norms   = fb.atoms.reshape(fb.K, -1).norm(dim=1)
     np.testing.assert_allclose(norms.numpy(), np.ones(fb.K), atol=1e-4)
 
 
 def test_conv_trainer_loss_decreases():
-    """Reconstruction loss at epoch 3 is lower than at epoch 1 (on synthetic data)."""
-    # Patch ConvDictTrainer to capture per-epoch loss.
-    # We run two short trainers and compare their final losses as a proxy.
-    imgs     = _synthetic_images(n=12, seed=7)
-    # Few epochs — loss should still trend downward over 4 epochs on this data.
+    """Reconstruction loss at epoch 4 is not worse than epoch 1 (on synthetic data)."""
+    dirty    = _synthetic_images(n=12, seed=7)
+    psf      = _gaussian_psf(dirty.shape[1], dirty.shape[2])
     trainer1 = ConvDictTrainer(k=4, atom_size=5, batch_size=4, n_epochs=1,
                                 fista_iter_train=10, random_seed=0)
     trainer4 = ConvDictTrainer(k=4, atom_size=5, batch_size=4, n_epochs=4,
                                 fista_iter_train=10, random_seed=0)
-    fb1 = trainer1.fit(imgs, device="cpu")
-    fb4 = trainer4.fit(imgs, device="cpu")
+    fb1 = trainer1.fit(dirty, psf, device="cpu")
+    fb4 = trainer4.fit(dirty, psf, device="cpu")
 
-    # Measure reconstruction error on training images with each filter bank.
     from mad_clean.solvers import ConvSolver
     import torch
 
@@ -141,19 +152,19 @@ def test_conv_trainer_loss_decreases():
             errors.append(float((img - recon).pow(2).mean()))
         return float(np.mean(errors))
 
-    err1 = _mean_recon_error(fb1, imgs)
-    err4 = _mean_recon_error(fb4, imgs)
-    # 4 epochs of training should not be worse than 1 epoch (5% slack for noise)
+    err1 = _mean_recon_error(fb1, dirty)
+    err4 = _mean_recon_error(fb4, dirty)
     assert err4 <= err1 * 1.05, f"err(4 epochs)={err4:.4f} > err(1 epoch)={err1:.4f}"
 
 
 def test_conv_trainer_save(tmp_path):
-    """ConvDictTrainer.save() writes a loadable .npy file."""
-    imgs    = _synthetic_images(n=8)
+    """ConvDictTrainer.save() writes a loadable .npz file."""
+    dirty   = _synthetic_images(n=8)
+    psf     = _gaussian_psf(dirty.shape[1], dirty.shape[2])
     trainer = ConvDictTrainer(k=4, atom_size=5, batch_size=4, n_epochs=1,
                                fista_iter_train=5)
-    fb      = trainer.fit(imgs, device="cpu")
-    path    = tmp_path / "conv_atoms.npy"
+    fb      = trainer.fit(dirty, psf, device="cpu")
+    path    = tmp_path / "conv_atoms.npz"
     trainer.save(path, fb)
     assert path.exists()
     fb2 = FilterBank.load(path)

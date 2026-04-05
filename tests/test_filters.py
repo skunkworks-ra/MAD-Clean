@@ -52,7 +52,7 @@ def test_filterbank_save_load_roundtrip():
     atoms = _random_atoms(k=4, f=5)
     fb    = FilterBank(atoms)
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "atoms.npy"
+        path = Path(tmp) / "atoms.npz"
         fb.save(path)
         fb2  = FilterBank.load(path)
     np.testing.assert_allclose(
