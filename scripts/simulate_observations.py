@@ -40,7 +40,7 @@ def _make_gaussian_psf(fwhm: float, size: int) -> np.ndarray:
     """
     Build a 2D Gaussian PSF of given FWHM (pixels), centred at (size//2, size//2).
 
-    The PSF is normalised to sum to 1.
+    Peak-normalised to 1.0 (CASA convention: dirty ≈ PSF-blurred clean).
     """
     sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
     cy, cx = size // 2, size // 2
@@ -48,27 +48,28 @@ def _make_gaussian_psf(fwhm: float, size: int) -> np.ndarray:
     xs = np.arange(size, dtype=np.float32) - cx
     yy, xx = np.meshgrid(ys, xs, indexing="ij")
     psf = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2)).astype(np.float32)
-    psf /= psf.sum()
+    psf /= psf.max()
     return psf
 
 
 def _load_psf(path: str | Path, target_shape: tuple) -> np.ndarray:
     """
-    Load PSF from FITS or .npy file. Crop or pad to target_shape (H, W).
-    Normalise to sum=1.
+    Load PSF from .npz, .npy, or FITS file. Crop or pad to target_shape (H, W).
+    Peak-normalised to 1.0 (CASA convention).
     """
     path = Path(path)
-    if path.suffix.lower() in (".fits", ".fit"):
+    if path.suffix.lower() == ".npz":
+        data = np.load(path)["psf"].astype(np.float32)
+    elif path.suffix.lower() == ".npy":
+        data = np.load(path).astype(np.float32)
+    elif path.suffix.lower() in (".fits", ".fit"):
         from astropy.io import fits
         with fits.open(path) as hdul:
             data = hdul[0].data.astype(np.float32)
-            # FITS may have extra axes (e.g. Stokes, frequency)
             while data.ndim > 2:
                 data = data[0]
-    elif path.suffix.lower() == ".npy":
-        data = np.load(path).astype(np.float32)
     else:
-        raise ValueError(f"Unsupported PSF format: {path.suffix} — use .fits or .npy")
+        raise ValueError(f"Unsupported PSF format: {path.suffix} — use .npz, .npy, or .fits")
 
     H, W = target_shape
     h, w = data.shape
@@ -87,9 +88,10 @@ def _load_psf(path: str | Path, target_shape: tuple) -> np.ndarray:
         out[ph:ph + data.shape[0], pw:pw + data.shape[1]] = data
         data = out
 
-    psf_sum = data.sum()
-    if psf_sum > 1e-12:
-        data /= psf_sum
+    # Peak-normalise: CASA convention (peak=1 at beam centre)
+    peak = data.max()
+    if peak > 1e-12:
+        data /= peak
     return data
 
 

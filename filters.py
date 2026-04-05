@@ -70,17 +70,20 @@ class FilterBank:
     # ── serialisation ─────────────────────────────────────────────────────────
 
     def save(self, path: str | Path) -> None:
-        """Save raw atoms (before normalisation) as .npy for portability."""
-        path = Path(path)
+        """Save atoms as .npz (key 'atoms') for consistency with other data files."""
+        path = Path(path).with_suffix(".npz")
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(path, self.atoms.cpu().numpy())
+        np.savez(path, atoms=self.atoms.cpu().numpy())
 
     @classmethod
     def load(cls, path: str | Path,
              device: str | torch.device = "cpu") -> "FilterBank":
-        """Load a FilterBank from a .npy file saved by save()."""
-        path  = Path(path)
-        atoms = np.load(path).astype(np.float32)
+        """Load a FilterBank from a .npz or legacy .npy file."""
+        path = Path(path)
+        if path.suffix == ".npy":
+            atoms = np.load(path).astype(np.float32)
+        else:
+            atoms = np.load(path.with_suffix(".npz"))["atoms"].astype(np.float32)
         return cls(atoms, device=device)
 
     # ── helpers ───────────────────────────────────────────────────────────────

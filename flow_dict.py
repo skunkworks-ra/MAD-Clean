@@ -339,18 +339,22 @@ class FlowTrainer:
 
     def fit(
         self,
-        dirty  : np.ndarray,
-        clean  : np.ndarray,
-        device : str = "cpu",
+        dirty       : np.ndarray,
+        clean       : np.ndarray,
+        device      : str = "cpu",
+        resume_from : Optional[str | Path] = None,
     ) -> FlowModel:
         """
         Train on paired (N, H, W) dirty and clean float32 images.
 
         Parameters
         ----------
-        dirty  : np.ndarray (N, H, W) float32 — PSF-convolved + noise
-        clean  : np.ndarray (N, H, W) float32 — ground truth sky
-        device : torch device string
+        dirty       : np.ndarray (N, H, W) float32 — PSF-convolved + noise
+        clean       : np.ndarray (N, H, W) float32 — ground truth sky
+        device      : torch device string
+        resume_from : path to an existing .pt checkpoint to resume from.
+                      Loads weights into the model before training begins.
+                      n_epochs additional epochs are run on top of the checkpoint.
         """
         assert dirty.shape == clean.shape, (
             f"dirty {dirty.shape} and clean {clean.shape} must match"
@@ -366,7 +370,11 @@ class FlowTrainer:
         clean  = (clean - c_mean) / c_std
         dirty  = (dirty - c_mean) / c_std
 
-        fm        = FlowModel(device=device)
+        if resume_from is not None:
+            fm = FlowModel.load(resume_from, device=device)
+            print(f"Resuming from {resume_from} — running {self.n_epochs} additional epochs")
+        else:
+            fm = FlowModel(device=device)
         optimizer = torch.optim.Adam(fm._net.parameters(), lr=self.lr)
 
         print(f"FlowTrainer (dirty→clean): N={N}  {H}×{W}  "

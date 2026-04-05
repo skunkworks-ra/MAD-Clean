@@ -118,6 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Variant C specific
     p.add_argument("--lr",               type=float, default=1e-4,
                    help="[C] Adam learning rate for FlowTrainer")
+    p.add_argument("--resume",           default=None,
+                   help="[C] Path to existing flow_model.pt to resume training from")
 
     return p
 
@@ -186,10 +188,22 @@ def main() -> None:
             print("ERROR: --variant C requires dirty images. "
                   "Run simulate_observations.py first.", file=sys.stderr)
             sys.exit(1)
-        fm = trainer.fit(dirty, clean, device=args.device)
+        fm = trainer.fit(dirty, clean, device=args.device, resume_from=args.resume)
         fm.save(out_path)
-    else:
-        fb = trainer.fit(images, device=args.device)
+    elif args.variant == "B":
+        if dirty is None:
+            print("ERROR: --variant B requires dirty images (PSF-residual training). "
+                  "Run simulate_observations.py first.", file=sys.stderr)
+            sys.exit(1)
+        if "psf" not in data:
+            print("ERROR: --variant B requires a 'psf' key in the .npz data file.",
+                  file=sys.stderr)
+            sys.exit(1)
+        psf = data["psf"].astype(np.float32)
+        fb = trainer.fit(dirty, psf, device=args.device)
+        trainer.save(out_path, fb)
+    else:  # A — trains on clean images (clean-sky representation)
+        fb = trainer.fit(clean, device=args.device)
         trainer.save(out_path, fb)
     print(f"Done → {out_path}")
 

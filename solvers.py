@@ -137,29 +137,32 @@ class ConvSolver:
     """
     Convolutional sparse coding via FISTA (pure PyTorch, no SPORCO).
 
-    Solves:
+    Without PSF:
         min_{Z_k}  (1/2) ||Σ_k d_k ⊛ z_k  -  island||²  +  λ Σ_k ||z_k||_1
 
-    where {d_k} are the K convolutional filters (atoms) and {z_k} are the
-    2D activation maps (one per filter, same spatial size as island).
+    With PSF (psf != None):
+        min_{Z_k}  (1/2) ||PSF * (Σ_k d_k ⊛ z_k)  -  island||²  +  λ Σ_k ||z_k||_1
 
-    Algorithm: FISTA with analytic Lipschitz constant from filter FFTs.
-    All operations in PyTorch — runs on GPU if FilterBank is on GPU.
+        decode_island() returns D*Z (clean-sky estimate), not PSF*(D*Z).
+        This matches ConvDictTrainer PSF-residual training.
 
     Parameters
     ----------
     filter_bank : FilterBank
-    lmbda       : float  L1 sparsity penalty (default 0.1)
-    n_iter      : int    FISTA iterations (default 100)
-    tol         : float  early stopping — relative change in objective (default 1e-4)
+    lmbda       : float             L1 sparsity penalty (default 0.1)
+    n_iter      : int               FISTA iterations (default 100)
+    tol         : float             early stopping tolerance (default 1e-4)
+    psf         : np.ndarray | None (H_psf, W_psf) peak-normalised PSF.
+                                    If given, PSF-residual FISTA is used.
     """
 
     def __init__(
         self,
         filter_bank : FilterBank,
-        lmbda       : float = 0.1,
-        n_iter      : int   = 100,
-        tol         : float = 1e-4,
+        lmbda       : float                       = 0.1,
+        n_iter      : int                         = 100,
+        tol         : float                       = 1e-4,
+        psf         : "np.ndarray | None"         = None,
     ):
         self.fb     = filter_bank
         self.lmbda  = lmbda
@@ -168,6 +171,33 @@ class ConvSolver:
         self.F      = filter_bank.F
         self.K      = filter_bank.K
         self.device = filter_bank.device
+        self._psf   = psf  # (H_psf, W_psf) numpy float32, or None
+
+    def _psf_fft(self, H: int, W: int) -> "torch.Tensor | None":
+        """
+        Centre-crop or zero-pad the stored PSF to (H, W) and return its rfft2.
+        Returns None if no PSF was provided at construction.
+        """
+        if self._psf is None:
+            return None
+        psf = torch.from_numpy(self._psf).float().to(self.device)
+        pH, pW = psf.shape
+        # Centre-crop
+        if pH > H:
+            ch = (pH - H) // 2
+            psf = psf[ch : ch + H, :]
+        if pW > W:
+            cw = (pW - W) // 2
+            psf = psf[:, cw : cw + W]
+        # Zero-pad
+        h, w = psf.shape
+        if h < H or w < W:
+            out = torch.zeros(H, W, device=self.device)
+            ph = (H - h) // 2
+            pw = (W - w) // 2
+            out[ph : ph + h, pw : pw + w] = psf
+            psf = out
+        return torch.fft.rfft2(torch.fft.ifftshift(psf))
 
     def _lipschitz(self, atoms_fft: torch.Tensor, sig_shape: tuple) -> float:
         """
@@ -220,19 +250,27 @@ class ConvSolver:
 
     def _run_fista(
         self,
-        atoms_fft : torch.Tensor,   # (K, H, W//2+1) complex
-        island    : torch.Tensor,   # (H, W) spatial — used for gradient and stopping
+        atoms_fft : torch.Tensor,                    # (K, H, W//2+1) complex
+        island    : torch.Tensor,                    # (H, W)
         H         : int,
         W         : int,
+        psf_fft   : "torch.Tensor | None" = None,   # (H, W//2+1) complex, or None
     ) -> torch.Tensor:
         """
         Run FISTA and return activation maps Z (K, H, W).
 
-        This is the shared kernel used by both decode_island (inference) and
-        encode_island (CDL Z-step during training).
+        Without psf_fft: minimises  0.5||D*Z - island||² + λ||Z||₁
+        With    psf_fft: minimises  0.5||PSF*(D*Z) - island||² + λ||Z||₁
+                         The effective atoms are PSF*d_k in the Fourier domain.
+
+        Shared by decode_island (inference) and encode_island (CDL Z-step).
         """
+        # Effective atoms: PSF * D  (or D if no PSF)
+        eff_fft    = (psf_fft.unsqueeze(0) * atoms_fft) if psf_fft is not None \
+                     else atoms_fft
+
         island_fft = torch.fft.rfft2(island)
-        step       = 1.0 / self._lipschitz(atoms_fft, (H, W))
+        step       = 1.0 / self._lipschitz(eff_fft, (H, W))
         K          = self.K
         dev        = self.device
 
@@ -242,27 +280,24 @@ class ConvSolver:
         prev_obj = float("inf")
 
         for _ in range(self.n_iter):
-            # ── gradient of data fidelity at Y ────────────────────────────
             Y_fft        = torch.fft.rfft2(Y)
-            recon_fft    = (atoms_fft * Y_fft).sum(dim=0)
+            recon_fft    = (eff_fft * Y_fft).sum(dim=0)
             residual_fft = recon_fft - island_fft
-            grad_fft     = atoms_fft.conj() * residual_fft.unsqueeze(0)
+            grad_fft     = eff_fft.conj() * residual_fft
             grad         = torch.fft.irfft2(grad_fft, s=(H, W))
 
-            # ── proximal gradient + FISTA momentum ────────────────────────
             Z_new = self._soft_threshold(Y - step * grad, self.lmbda * step)
             t_new = (1.0 + (1.0 + 4.0 * t * t) ** 0.5) / 2.0
             Y     = Z_new + ((t - 1.0) / t_new) * (Z_new - Z)
             Z     = Z_new
             t     = t_new
 
-            # ── early stopping on relative objective change ───────────────
             with torch.no_grad():
-                recon_fft_new = (atoms_fft * torch.fft.rfft2(Z)).sum(dim=0)
-                recon_new     = torch.fft.irfft2(recon_fft_new, s=(H, W))
-                data_fid      = 0.5 * ((recon_new - island) ** 2).sum()
-                l1_term       = self.lmbda * Z.abs().sum()
-                obj           = float(data_fid + l1_term)
+                Z_fft_c   = torch.fft.rfft2(Z)
+                r_fft_c   = (eff_fft * Z_fft_c).sum(dim=0) - island_fft
+                recon_c   = torch.fft.irfft2(r_fft_c + island_fft, s=(H, W))
+                data_fid  = 0.5 * ((torch.fft.irfft2(r_fft_c, s=(H, W))) ** 2).sum()
+                obj       = float(data_fid + self.lmbda * Z.abs().sum())
                 if abs(prev_obj - obj) / (abs(prev_obj) + 1e-8) < self.tol:
                     break
                 prev_obj = obj
@@ -271,7 +306,10 @@ class ConvSolver:
 
     def decode_island(self, island: torch.Tensor) -> torch.Tensor:
         """
-        Decode a single source island via FISTA; return reconstruction.
+        Decode a single source island via FISTA; return clean-sky reconstruction.
+
+        Without PSF: minimises  ||D*Z - island||²  → returns D*Z
+        With PSF:    minimises  ||PSF*(D*Z) - island||² → returns D*Z (clean sky)
 
         Parameters
         ----------
@@ -279,12 +317,14 @@ class ConvSolver:
 
         Returns
         -------
-        recon : Tensor (H_i, W_i) float32 — Σ_k d_k ⊛ z_k*
+        recon : Tensor (H_i, W_i) float32 — Σ_k d_k ⊛ z_k  (clean-domain)
         """
         atoms_fft, island_w, H, W, orig_H, orig_W = self._prepare_atoms_fft(island)
-        Z      = self._run_fista(atoms_fft, island_w, H, W)
-        Z_fft  = torch.fft.rfft2(Z)
-        recon  = torch.fft.irfft2((atoms_fft * Z_fft).sum(dim=0), s=(H, W))
+        psf_fft = self._psf_fft(H, W)   # None if no PSF stored
+        Z       = self._run_fista(atoms_fft, island_w, H, W, psf_fft=psf_fft)
+        # Reconstruct in the clean domain (D*Z, without PSF)
+        Z_fft   = torch.fft.rfft2(Z)
+        recon   = torch.fft.irfft2((atoms_fft * Z_fft).sum(dim=0), s=(H, W))
         return recon[:orig_H, :orig_W].float()
 
     def encode_island(self, island: torch.Tensor) -> torch.Tensor:

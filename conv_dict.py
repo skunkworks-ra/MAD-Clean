@@ -34,6 +34,66 @@ from mad_clean.filters import FilterBank
 __all__ = ["ConvDictTrainer"]
 
 
+def _soft(x: torch.Tensor, threshold: float) -> torch.Tensor:
+    return x.sign() * (x.abs() - threshold).clamp(min=0.0)
+
+
+def _z_step_psf(
+    dirty_img   : torch.Tensor,   # (H, W)
+    atoms_fft   : torch.Tensor,   # (K, H, W//2+1) complex
+    psf_fft     : torch.Tensor,   # (H, W//2+1) complex
+    lmbda       : float,
+    n_iter      : int,
+    tol         : float,
+    K           : int,
+    H           : int,
+    W           : int,
+    dev         : torch.device,
+) -> torch.Tensor:
+    """
+    FISTA Z-step with PSF in the forward model (per image).
+
+    Minimises:  0.5 * ||PSF * (Σ_k d_k * z_k) - dirty||²  +  λ||Z||₁
+
+    The effective atoms seen by FISTA are PSF * d_k (in Fourier domain).
+    Returns Z: (K, H, W) — activation maps in the pre-PSF (clean) domain.
+    """
+    eff_fft  = psf_fft.unsqueeze(0) * atoms_fft          # (K, H, W//2+1)
+    L        = float((eff_fft.abs() ** 2).sum(0).max().real) + 1e-8
+    step     = 1.0 / L
+
+    dirty_fft = torch.fft.rfft2(dirty_img)                # (H, W//2+1)
+
+    Z = torch.zeros(K, H, W, device=dev)
+    Y = Z.clone()
+    t = 1.0
+    prev_obj = float("inf")
+
+    for _ in range(n_iter):
+        Y_fft    = torch.fft.rfft2(Y)                     # (K, H, W//2+1)
+        recon_fft = (eff_fft * Y_fft).sum(0)              # (H, W//2+1)
+        res_fft   = recon_fft - dirty_fft                 # (H, W//2+1)
+        grad_fft  = eff_fft.conj() * res_fft              # (K, H, W//2+1)
+        grad      = torch.fft.irfft2(grad_fft, s=(H, W)) # (K, H, W)
+
+        Z_new  = _soft(Y - step * grad, lmbda * step)
+        t_new  = (1.0 + (1.0 + 4.0 * t * t) ** 0.5) / 2.0
+        Y      = Z_new + ((t - 1.0) / t_new) * (Z_new - Z)
+        Z      = Z_new
+        t      = t_new
+
+        with torch.no_grad():
+            Z_fft_c    = torch.fft.rfft2(Z)
+            r_fft_c    = (eff_fft * Z_fft_c).sum(0) - dirty_fft
+            r_c        = torch.fft.irfft2(r_fft_c, s=(H, W))
+            obj        = float(0.5 * (r_c ** 2).sum() + lmbda * Z.abs().sum())
+            if abs(prev_obj - obj) / (abs(prev_obj) + 1e-8) < tol:
+                break
+            prev_obj = obj
+
+    return Z
+
+
 class ConvDictTrainer:
     """
     Train a convolutional filter bank via minibatch alternating minimisation.
@@ -80,32 +140,34 @@ class ConvDictTrainer:
 
     def fit(
         self,
-        images : np.ndarray,
+        dirty  : np.ndarray,
+        psf    : np.ndarray,
         device : str = "cpu",
     ) -> FilterBank:
         """
-        Train on (N, H, W) float32 images. Returns a FilterBank.
+        Train on (N, H, W) dirty images with PSF-residual loss.
+
+        Minimises:  0.5 * ||PSF * (Σ_k d_k * z_k) - dirty||²  +  λ||Z||₁
+
+        The atoms D live in the pre-PSF (clean-sky) domain.  Ground-truth
+        clean images are NOT required — the PSF serves as the forward model.
 
         Parameters
         ----------
-        images : np.ndarray (N, H, W) float32, values in [0, 1]
+        dirty  : np.ndarray (N, H, W) float32 — PSF-convolved observations
+        psf    : np.ndarray (H, W)    float32 — peak-normalised PSF (peak = 1)
         device : torch device for computation and the returned FilterBank
         """
-        # Import here to avoid circular import (ConvSolver imports FilterBank)
-        from mad_clean.solvers import ConvSolver
-
         dev = torch.device(device)
         rng = np.random.default_rng(self.random_seed)
         K, F = self.k, self.atom_size
-        N, H, W = images.shape
+        N, H, W = dirty.shape
 
-        # Per-image normalise: zero mean, unit variance — same as PatchDictTrainer.
-        # Without this, MSE is dominated by background zeros and atoms learn nothing.
-        img_mean = images.mean(axis=(1, 2), keepdims=True)
-        img_std  = images.std(axis=(1, 2), keepdims=True) + 1e-8
-        images   = (images - img_mean) / img_std
+        # Precompute PSF FFT (ifftshift moves peak from centre to (0,0))
+        psf_t       = torch.from_numpy(psf).float().to(dev)
+        psf_fft     = torch.fft.rfft2(torch.fft.ifftshift(psf_t), s=(H, W))  # (H, W//2+1)
 
-        print(f"ConvDictTrainer: K={K}  F={F}  images={N}×{H}×{W}  "
+        print(f"ConvDictTrainer (PSF-residual): K={K}  F={F}  images={N}×{H}×{W}  "
               f"batch={self.batch_size}  epochs={self.n_epochs}  device={dev}")
 
         # ── initialise D: random (K, F, F), each atom unit L2 norm ───────────
@@ -118,45 +180,40 @@ class ConvDictTrainer:
 
         # ── training loop ─────────────────────────────────────────────────────
         for epoch in range(self.n_epochs):
-            idx          = rng.permutation(N)
-            epoch_loss   = 0.0
-            epoch_spar   = 0.0
-            n_batches    = 0
+            idx        = rng.permutation(N)
+            epoch_loss = 0.0
+            epoch_spar = 0.0
+            n_batches  = 0
 
             for b_start in range(0, N, self.batch_size):
                 batch_idx = idx[b_start : b_start + self.batch_size]
-                batch_np  = images[batch_idx]
-                batch     = torch.from_numpy(batch_np).float().to(dev)
+                batch_np  = dirty[batch_idx]
+                batch     = torch.from_numpy(batch_np).float().to(dev)  # (B, H, W)
                 B         = len(batch)
 
-                # ── Z-step: FISTA per image, no gradient through D ────────────
-                # Create a temporary FilterBank from current D so ConvSolver
-                # can compute its atom FFTs and Lipschitz constant.
-                # FilterBank normalises atoms — since we project onto unit ball
-                # after each D-step, this is essentially a no-op (norms ≈ 1).
+                # ── Z-step: PSF-aware FISTA per image, no gradient ────────────
                 with torch.no_grad():
-                    fb_tmp = FilterBank(D.detach().cpu().numpy(), device=device)
-                    solver = ConvSolver(
-                        fb_tmp,
-                        lmbda  = self.lmbda,
-                        n_iter = self.fista_iter_train,
-                        tol    = self.tol,
-                    )
-                    Z_list = [solver.encode_island(batch[i]) for i in range(B)]
-                    # Z_list[i]: (K, H_w, W_w) — H_w, W_w >= H, W (may be padded)
-                    # Crop to (K, H, W) so the D-step forward model is consistent.
-                    Z = torch.stack([z[:, :H, :W] for z in Z_list]).detach()
-                    # Z: (B, K, H, W) float32, no grad
+                    D_padded_z = F_.pad(D.detach(), (0, W - F, 0, H - F))  # (K, H, W)
+                    atoms_fft  = torch.fft.rfft2(D_padded_z)               # (K, H, W//2+1)
+                    Z_list = [
+                        _z_step_psf(
+                            batch[i], atoms_fft, psf_fft,
+                            self.lmbda, self.fista_iter_train, self.tol,
+                            K, H, W, dev,
+                        )
+                        for i in range(B)
+                    ]
+                    Z = torch.stack(Z_list).detach()                        # (B, K, H, W)
 
-                # ── D-step: forward model via FFT, backprop, Adam, project ─────
+                # ── D-step: PSF-residual loss, backprop, Adam, project ────────
                 optimizer.zero_grad()
 
-                # Pad D from (K, F, F) to (K, H, W) for full-image convolution.
-                D_padded  = F_.pad(D, (0, W - F, 0, H - F))          # (K, H, W)
-                D_fft     = torch.fft.rfft2(D_padded)                 # (K, H, W//2+1)
-                Z_fft     = torch.fft.rfft2(Z)                        # (B, K, H, W//2+1)
-                recon_fft = (D_fft.unsqueeze(0) * Z_fft).sum(dim=1)  # (B, H, W//2+1)
-                recon     = torch.fft.irfft2(recon_fft, s=(H, W))    # (B, H, W)
+                D_padded  = F_.pad(D, (0, W - F, 0, H - F))               # (K, H, W)
+                D_fft     = torch.fft.rfft2(D_padded)                      # (K, H, W//2+1)
+                D_psf_fft = psf_fft.unsqueeze(0) * D_fft                   # (K, H, W//2+1)
+                Z_fft     = torch.fft.rfft2(Z)                             # (B, K, H, W//2+1)
+                recon_fft = (D_psf_fft.unsqueeze(0) * Z_fft).sum(dim=1)   # (B, H, W//2+1)
+                recon     = torch.fft.irfft2(recon_fft, s=(H, W))         # (B, H, W)
 
                 loss = 0.5 * ((recon - batch) ** 2).mean()
                 loss.backward()
@@ -164,9 +221,8 @@ class ConvDictTrainer:
 
                 # Project each atom onto unit L2 ball: d_k ← d_k / max(‖d_k‖, 1)
                 with torch.no_grad():
-                    norms_t = D.data.reshape(K, -1).norm(dim=1)   # (K,)
-                    scale   = norms_t.clamp(min=1.0)
-                    D.data /= scale.reshape(K, 1, 1)
+                    norms_t = D.data.reshape(K, -1).norm(dim=1)
+                    D.data /= norms_t.clamp(min=1.0).reshape(K, 1, 1)
 
                 epoch_loss += float(loss)
                 epoch_spar += float((Z.abs() < 1e-6).float().mean())
