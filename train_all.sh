@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# train_all.sh — Full VLA PSF training pipeline: extract → simulate → A → B → C
+# train_all.sh — Full VLA PSF training pipeline: simulate → A → B → C
+#
+# Prerequisites:
+#   1. pixi run fetch                    (download CRUMB clean images)
+#   2. python scripts/extract_psf.py \   (requires casatools / CASA)
+#        --psf <casa.psf> --out models/psf.npz
 #
 # Usage:
-#   bash train_all.sh [cuda|cpu] [/path/to/casa.psf]
+#   bash train_all.sh [cuda|cpu]
 #
 # Resume Variant C only (continues from existing flow_model.pt):
 #   bash train_all.sh cuda resume_c [extra_epochs]
@@ -10,22 +15,20 @@
 #
 # Arguments:
 #   $1  device        cuda (default) or cpu
-#   $2  PSF_SOURCE    CASA image table path for the VLA PSF, OR "resume_c"
-#                     (default: /home/pjaganna/Data/taylor_home/three_points/dirty_spw4.psf)
+#   $2  resume_c      if set, resume Variant C from existing checkpoint
 #   $3  extra_epochs  [resume_c only] additional epochs to train (default 200)
 #
-# Outputs (all .npz except the PyTorch flow model):
-#   models/psf.npz                  extracted VLA PSF
+# Outputs:
 #   crumb_data/flow_pairs_vla.npz   simulated dirty/clean pairs
 #   models/cdl_filters_patch.npz    Variant A atoms
 #   models/cdl_filters_conv.npz     Variant B atoms  (PSF-residual training)
 #   models/flow_model.pt            Variant C flow model
-#   logs/                           per-step logs
+#   logs/                           per-step logs (tail -f logs/train_A.log etc.)
 
 set -euo pipefail
 
 DEVICE="${1:-cuda}"
-PSF_SOURCE="${2:-/home/pjaganna/Data/taylor_home/three_points/dirty_spw4.psf}"
+MODE="${2:-}"
 
 PSF_NPZ="models/psf.npz"
 DATA="crumb_data/flow_pairs_vla.npz"
@@ -38,7 +41,7 @@ PIXI_ENV="gpu"
 mkdir -p "$MODELS" "$LOGS"
 
 # ── Resume Variant C only ─────────────────────────────────────────────────────
-if [[ "$PSF_SOURCE" == "resume_c" ]]; then
+if [[ "$MODE" == "resume_c" ]]; then
     EXTRA_EPOCHS="${3:-200}"
     CHECKPOINT="$MODELS/flow_model.pt"
 
@@ -59,7 +62,7 @@ if [[ "$PSF_SOURCE" == "resume_c" ]]; then
     echo " Started    : $(date)"
     echo "============================================================"
 
-    pixi run -e "$PIXI_ENV" python scripts/run_train.py \
+    pixi run -e "$PIXI_ENV" python -u scripts/train.py \
         --variant    C \
         --data       "$DATA" \
         --out        "$CHECKPOINT" \
@@ -82,43 +85,29 @@ fi
 echo "============================================================"
 echo " MAD-CLEAN full training pipeline"
 echo " Device    : $DEVICE  (pixi env: $PIXI_ENV)"
-echo " PSF source: $PSF_SOURCE"
+echo " PSF npz   : $PSF_NPZ"
 echo " Data      : $DATA"
 echo " Started   : $(date)"
 echo "============================================================"
 
-# ── guard: clean images must exist ──────────────────────────────────────────
+# ── guards: required inputs ───────────────────────────────────────────────────
 if [[ ! -f "crumb_data/crumb_preprocessed.npz" ]]; then
     echo "ERROR: crumb_data/crumb_preprocessed.npz not found. Run 'pixi run fetch' first." >&2
     exit 1
 fi
-
-# ── Step 0a: extract VLA PSF (skipped if already exists) ─────────────────────
-echo ""
-if [[ -f "$PSF_NPZ" ]]; then
-    echo ">>> STEP 0a  PSF already extracted — $PSF_NPZ  (skipping)"
-else
-    echo ">>> STEP 0a  extract VLA PSF from CASA image"
-    echo "    Source : $PSF_SOURCE"
-    echo "    Output : $PSF_NPZ"
-    echo "    Log    : $LOGS/extract_psf.log"
-
-    python /home/pjaganna/Software/MAD-clean/scripts/extract_psf.py \
-        --psf  "$PSF_SOURCE" \
-        --out  "$PSF_NPZ" \
-        --size 150 \
-        2>&1 | tee "$LOGS/extract_psf.log"
-
-    echo ">>> PSF extracted — $PSF_NPZ"
+if [[ ! -f "$PSF_NPZ" ]]; then
+    echo "ERROR: $PSF_NPZ not found." >&2
+    echo "  Extract it first with:  python scripts/extract_psf.py --psf <casa.psf> --out $PSF_NPZ" >&2
+    exit 1
 fi
 
-# ── Step 0b: simulate dirty/clean pairs ──────────────────────────────────────
+# ── Step 0: simulate dirty/clean pairs ───────────────────────────────────────
 echo ""
-echo ">>> STEP 0b  simulate dirty/clean pairs with VLA PSF"
+echo ">>> STEP 0  simulate dirty/clean pairs with VLA PSF"
 echo "    Output : $DATA"
 echo "    Log    : $LOGS/simulate.log"
 
-pixi run -e "$PIXI_ENV" python scripts/simulate_observations.py \
+pixi run -e "$PIXI_ENV" python -u scripts/simulate.py \
     --data      crumb_data/crumb_preprocessed.npz \
     --psf       "$PSF_NPZ" \
     --noise_std 0.05 \
@@ -133,17 +122,17 @@ echo ">>> VARIANT A  (patch dictionary, OMP — trains on clean images)"
 echo "    Output : $MODELS/cdl_filters_patch.npz"
 echo "    Log    : $LOGS/train_A.log"
 
-pixi run -e "$PIXI_ENV" python scripts/run_train.py \
-    --variant        A \
-    --data           "$DATA" \
-    --out            "$MODELS/cdl_filters_patch.npz" \
-    --device         "$DEVICE" \
-    --k              128 \
-    --atom_size      15 \
-    --lmbda          0.5 \
-    --n_epochs       500 \
-    --fista_iter     100 \
-    --lr_d           1e-3 \
+pixi run -e "$PIXI_ENV" python -u scripts/train.py \
+    --variant         A \
+    --data            "$DATA" \
+    --out             "$MODELS/cdl_filters_patch" \
+    --device          "$DEVICE" \
+    --k               128 \
+    --atom_size       15 \
+    --lmbda           0.5 \
+    --n_epochs        500 \
+    --fista_iter      100 \
+    --lr_d            1e-3 \
     --patches_per_img 50 \
     2>&1 | tee "$LOGS/train_A.log"
 
@@ -155,10 +144,10 @@ echo ">>> VARIANT B  (CDL FISTA — PSF-residual loss, trains on dirty images)"
 echo "    Output : $MODELS/cdl_filters_conv.npz"
 echo "    Log    : $LOGS/train_B.log"
 
-pixi run -e "$PIXI_ENV" python scripts/run_train.py \
+pixi run -e "$PIXI_ENV" python -u scripts/train.py \
     --variant          B \
     --data             "$DATA" \
-    --out              "$MODELS/cdl_filters_conv.npz" \
+    --out              "$MODELS/cdl_filters_conv" \
     --device           "$DEVICE" \
     --k                128 \
     --atom_size        15 \
@@ -177,19 +166,19 @@ echo ">>> VARIANT C  (conditional flow matching, dirty→clean)"
 echo "    Output : $MODELS/flow_model.pt"
 echo "    Log    : $LOGS/train_C.log"
 
-pixi run -e "$PIXI_ENV" python scripts/run_train.py \
+pixi run -e "$PIXI_ENV" python -u scripts/train.py \
     --variant    C \
     --data       "$DATA" \
     --out        "$MODELS/flow_model.pt" \
     --device     "$DEVICE" \
-    --n_epochs   100 \
+    --n_epochs   500 \
     --batch_size 8 \
     --lr         1e-4 \
     2>&1 | tee "$LOGS/train_C.log"
 
 echo ">>> Variant C complete — $MODELS/flow_model.pt"
 
-# ── summary ──────────────────────────────────────────────────────────────────
+# ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "============================================================"
 echo " All training complete: $(date)"

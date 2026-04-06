@@ -44,6 +44,9 @@ pytorch-cuda = {version = ">=12.1", channel = "pytorch"}
 default = {features = ["cpu"], solve-group = "cpu"}
 gpu     = {features = ["gpu"], solve-group = "gpu"}
 
+[tool.pixi.activation]
+env = {PYTHONPATH = "$PIXI_PROJECT_ROOT"}
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 
