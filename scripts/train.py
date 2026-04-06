@@ -114,11 +114,12 @@ def main() -> None:
             print("ERROR: --variant B requires dirty images. Run scripts/simulate.py first.",
                   file=sys.stderr)
             sys.exit(1)
-        if "psf" not in data:
-            print("ERROR: --variant B requires a 'psf' key in the .npz data file.",
+        if "psf_norm" not in data:
+            print("ERROR: --variant B requires a 'psf_norm' key in the .npz data file.",
                   file=sys.stderr)
+            print("       Re-run scripts/simulate.py to regenerate the data.", file=sys.stderr)
             sys.exit(1)
-        psf = data["psf"].astype(np.float32)
+        psf = data["psf_norm"].astype(np.float32)
         trainer = ConvDictTrainer(
             k                = args.k,
             atom_size        = args.atom_size,

@@ -180,13 +180,20 @@ class SimulateObservations:
         print(f"Clean (norm)  std={clean_n.std():.3f}  "
               f"range=[{clean_n.min():.3f}, {clean_n.max():.3f}]")
 
+        # psf_norm = psf / psf_area — the PSF paired with dirty_n for CDL training.
+        # ConvDictTrainer's FISTA forward model must use psf_norm, not psf, since
+        # dirty_n = dirty / psf_area = (psf_norm ⊛ clean_n) + noise/psf_area.
+        psf_norm = (psf / normaliser.area).astype(np.float32)
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             out_path,
             clean     = clean_n,
             dirty     = dirty_n,
             psf       = psf,
+            psf_norm  = psf_norm,
             psf_area  = np.float32(normaliser.area),
             noise_std = np.float32(self.noise_std),
         )
-        print(f"Saved → {out_path}  keys: clean {clean_n.shape}, dirty {dirty_n.shape}, psf {psf.shape}")
+        print(f"Saved → {out_path}  keys: clean {clean_n.shape}, dirty {dirty_n.shape}, "
+              f"psf {psf.shape}  psf_norm (sum={psf_norm.sum():.4f})")
