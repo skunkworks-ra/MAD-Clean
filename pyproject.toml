@@ -19,7 +19,7 @@ mad-deconvolve = "scripts.deconvolve:main"
 mad-simulate   = "scripts.simulate:main"
 mad-eval       = "scripts.eval:main"
 
-[tool.pixi.project]
+[tool.pixi.workspace]
 channels  = ["pytorch", "conda-forge"]
 platforms = ["linux-64"]
 

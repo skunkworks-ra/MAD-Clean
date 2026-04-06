@@ -24,7 +24,7 @@ FlowModel
 FlowTrainer
     fit(dirty, clean, device) → FlowModel
     Trains dirty→clean CFM with 8-fold on-the-fly augmentation.
-    Normalisation applied using clean image statistics (applied to both arrays).
+    Expects PSF-area-normalised inputs from SimulateObservations.
 """
 
 from __future__ import annotations
@@ -314,8 +314,8 @@ class FlowTrainer:
     5. CFM loss: ‖v_θ(x_t, t) − u‖²
     6. Adam step
 
-    Normalisation: per-image using clean image statistics applied to both
-    dirty and clean, preserving the relative dirty/clean amplitude difference.
+    Normalisation: expects pre-normalised inputs (PSF-area normalisation applied
+    by SimulateObservations). No additional normalisation is applied here.
 
     Parameters
     ----------
@@ -362,13 +362,6 @@ class FlowTrainer:
         dev = torch.device(device)
         rng = np.random.default_rng(self.random_seed)
         N, H, W = clean.shape
-
-        # Normalise using clean statistics; apply same transform to dirty so
-        # the relative dirty/clean difference (blurring + noise) is preserved.
-        c_mean = clean.mean(axis=(1, 2), keepdims=True)
-        c_std  = clean.std(axis=(1, 2),  keepdims=True) + 1e-8
-        clean  = (clean - c_mean) / c_std
-        dirty  = (dirty - c_mean) / c_std
 
         if resume_from is not None:
             fm = FlowModel.load(resume_from, device=device)

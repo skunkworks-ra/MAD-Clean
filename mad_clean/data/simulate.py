@@ -26,6 +26,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ..normalise import ImageNormaliser
+
 __all__ = ["SimulateObservations"]
 
 
@@ -148,6 +150,7 @@ class SimulateObservations:
         N, H, W = clean.shape
         print(f"Loaded {N} clean images  shape={H}×{W}")
 
+        # Per-image normalisation of clean (zero mean, unit std).
         img_mean = clean.mean(axis=(1, 2), keepdims=True)
         img_std  = clean.std(axis=(1, 2),  keepdims=True) + 1e-8
         clean_n  = (clean - img_mean) / img_std
@@ -160,15 +163,22 @@ class SimulateObservations:
             psf = _load_psf(self.psf_path, target_shape=(H, W))
             print(f"Loaded PSF from {self.psf_path}  shape={psf.shape}")
 
-        dirty_n = _convolve_psf(clean_n, psf)
+        # Dirty = PSF ⊛ clean_n + noise (in PSF-convolved flux units).
+        dirty = _convolve_psf(clean_n, psf)
+        rng   = np.random.default_rng(self.seed)
+        dirty += rng.standard_normal(dirty.shape).astype(np.float32) * self.noise_std
 
-        rng      = np.random.default_rng(self.seed)
-        noise    = rng.standard_normal(dirty_n.shape).astype(np.float32) * self.noise_std
-        dirty_n += noise
+        # Area normalisation: divide by PSF total flux so dirty ≈ clean in scale.
+        normaliser = ImageNormaliser().fit(psf)
+        dirty_n    = normaliser.transform(dirty)
 
-        print(f"Dirty images  noise_std={self.noise_std}  "
-              f"dirty range=[{dirty_n.min():.3f}, {dirty_n.max():.3f}]  "
-              f"clean range=[{clean_n.min():.3f}, {clean_n.max():.3f}]")
+        print(f"PSF area (sum): {normaliser.area:.2f}")
+        print(f"Dirty (raw)   std={dirty.std():.3f}  "
+              f"range=[{dirty.min():.3f}, {dirty.max():.3f}]")
+        print(f"Dirty (norm)  std={dirty_n.std():.3f}  "
+              f"range=[{dirty_n.min():.3f}, {dirty_n.max():.3f}]")
+        print(f"Clean (norm)  std={clean_n.std():.3f}  "
+              f"range=[{clean_n.min():.3f}, {clean_n.max():.3f}]")
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
@@ -176,6 +186,7 @@ class SimulateObservations:
             clean     = clean_n,
             dirty     = dirty_n,
             psf       = psf,
+            psf_area  = np.float32(normaliser.area),
             noise_std = np.float32(self.noise_std),
         )
         print(f"Saved → {out_path}  keys: clean {clean_n.shape}, dirty {dirty_n.shape}, psf {psf.shape}")

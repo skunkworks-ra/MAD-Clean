@@ -1,20 +1,30 @@
 """
 mad_clean.normalise
 ===================
-Canonical normalisation for dirty/clean image pairs.
+Physically motivated normalisation for dirty/clean image pairs.
 
-Fixes the double-normalisation bug: previously simulate_observations.py
-normalised before saving, then FlowTrainer normalised again, and eval
-scripts had to add a third pass.  Now one class owns the transform and its
-inverse — call it once at data generation time, once at inference.
+Area normalisation
+------------------
+Divides dirty images by the PSF total flux (sum over all pixels).
+
+Since dirty = PSF ⊛ clean, this approximately restores the clean flux
+scale:  dirty / psf.sum() ≈ clean  (ideal, noise-free case).
+
+This is physically motivated: the PSF area sets the amplitude relationship
+between dirty and clean.  Per-image std normalisation is arbitrary and not
+flux-conserving — it destroys the dirty/clean amplitude relationship.
 
 Usage
 -----
-    normaliser = ImageNormaliser().fit(clean)
-    clean_n, dirty_n = normaliser.fit_transform(clean, dirty)
+    normaliser = ImageNormaliser().fit(psf)
+    dirty_n    = normaliser.transform(dirty)
 
-    # At inference, invert to get flux-calibrated output:
+    # At inference, invert to recover flux-calibrated output:
     model_flux = normaliser.inverse_transform(model_n)
+
+    # Save/restore the area factor alongside the data:
+    np.savez("data.npz", ..., psf_area=normaliser.area)
+    normaliser = ImageNormaliser(area=float(data["psf_area"]))
 """
 
 from __future__ import annotations
@@ -26,82 +36,78 @@ __all__ = ["ImageNormaliser"]
 
 class ImageNormaliser:
     """
-    Per-image normalisation using clean image statistics.
+    PSF-area normalisation for dirty images.
 
-    Normalises both clean and dirty arrays using the per-image mean and std
-    of the clean array.  This preserves the relative amplitude difference
-    (blurring + noise) between dirty and clean — the model learns the
-    dirty→clean mapping in a well-scaled space.
+    The normalisation factor is the scalar PSF total flux (psf.sum()).
+    This is a global constant for the dataset — all images are divided by
+    the same value, preserving the relative flux relationships across images.
 
     Parameters
     ----------
-    None at construction.  Call fit() before transform().
+    area : float | None
+        Pre-computed PSF area.  If provided, fit() is not needed.
+        Useful for restoring a saved normaliser from npz metadata.
     """
 
-    def fit(self, clean: np.ndarray) -> "ImageNormaliser":
+    def __init__(self, area: float | None = None):
+        if area is not None:
+            self._area = float(area)
+
+    # ------------------------------------------------------------------
+    @property
+    def area(self) -> float:
+        """PSF total flux used as normalisation divisor."""
+        if not hasattr(self, "_area"):
+            raise RuntimeError("ImageNormaliser has not been fit. Call fit(psf) first.")
+        return self._area
+
+    # ------------------------------------------------------------------
+    def fit(self, psf: np.ndarray) -> "ImageNormaliser":
         """
-        Compute per-image mean and std from a clean image array.
+        Compute the normalisation area from the PSF.
 
         Parameters
         ----------
-        clean : np.ndarray (N, H, W) float32
+        psf : np.ndarray (H, W) float32 — peak-normalised PSF (peak = 1)
 
         Returns
         -------
         self — for method chaining
         """
-        self._mean = clean.mean(axis=(1, 2), keepdims=True)   # (N, 1, 1)
-        self._std  = clean.std(axis=(1, 2),  keepdims=True) + 1e-8
+        self._area = float(np.asarray(psf, dtype=np.float64).sum())
         return self
 
-    def transform(self, images: np.ndarray) -> np.ndarray:
+    # ------------------------------------------------------------------
+    def transform(self, dirty: np.ndarray) -> np.ndarray:
         """
-        Apply normalisation: (images - mean) / std.
+        Normalise dirty images: dirty / area.
 
         Parameters
         ----------
-        images : np.ndarray (N, H, W) float32 — same N as fit() array
+        dirty : np.ndarray (N, H, W) float32
 
         Returns
         -------
-        np.ndarray float32, normalised
+        np.ndarray float32 — dirty images in clean-flux units
         """
-        return ((images - self._mean) / self._std).astype(np.float32)
+        return (dirty / self.area).astype(np.float32)
 
-    def inverse_transform(self, images: np.ndarray) -> np.ndarray:
+    # ------------------------------------------------------------------
+    def inverse_transform(self, dirty_n: np.ndarray) -> np.ndarray:
         """
-        Invert normalisation: images * std + mean.
+        Invert normalisation: dirty_n * area.
 
         Parameters
         ----------
-        images : np.ndarray (N, H, W) float32 — normalised array
+        dirty_n : np.ndarray (N, H, W) float32 — normalised dirty images
 
         Returns
         -------
-        np.ndarray float32, in original flux units
+        np.ndarray float32 — dirty images in original flux units
         """
-        return (images * self._std + self._mean).astype(np.float32)
+        return (dirty_n * self.area).astype(np.float32)
 
-    def fit_transform(
-        self,
-        clean: np.ndarray,
-        dirty: np.ndarray | None = None,
-    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-        """
-        Fit on clean, then transform clean (and optionally dirty).
-
-        Parameters
-        ----------
-        clean : np.ndarray (N, H, W)
-        dirty : np.ndarray (N, H, W) or None
-
-        Returns
-        -------
-        clean_n            — if dirty is None
-        (clean_n, dirty_n) — if dirty is provided
-        """
-        self.fit(clean)
-        clean_n = self.transform(clean)
-        if dirty is not None:
-            return clean_n, self.transform(dirty)
-        return clean_n
+    # ------------------------------------------------------------------
+    def __repr__(self) -> str:
+        area_str = f"{self._area:.4f}" if hasattr(self, "_area") else "not fit"
+        return f"ImageNormaliser(area={area_str})"
