@@ -28,7 +28,7 @@ from .filters import FilterBank
 from ._utils import soft_threshold
 
 
-__all__ = ["PatchSolver", "ConvSolver", "FlowSolver", "DPSSolver"]
+__all__ = ["PatchSolver", "ConvSolver", "FlowSolver", "DPSSolver", "AmortisedSolver"]
 
 
 # ── Variant A — Patch Dictionary Solver ───────────────────────────────────────
@@ -461,38 +461,32 @@ class DPSSolver:
         self._psf_fft      = psf_fft          # forward: PSF * x̂₁
         self._psf_fft_conj = psf_fft.conj()   # backward: PSF^T * r (correlation)
 
-    def sample(
+    def _run_euler(
         self,
         dirty    : torch.Tensor,
-        n_samples: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n_samples: int,
+    ) -> torch.Tensor:
         """
-        Draw n_samples posterior estimates of the clean image.
+        Core Euler integration loop. Returns all posterior draws.
 
         Parameters
         ----------
-        dirty     : (H_i, W_i) float32 Tensor — observed dirty island
-        n_samples : override constructor n_samples if provided
+        dirty     : (H_i, W_i) float32 Tensor — already on self.device
+        n_samples : number of independent trajectories
 
         Returns
         -------
-        mean : (H_i, W_i) — posterior mean
-        std  : (H_i, W_i) — posterior std  (zeros if n_samples == 1)
+        x_clean : (S, H_i, W_i) — raw posterior samples (no averaging)
         """
-        S   = n_samples if n_samples is not None else self.n_samples
+        S   = n_samples
         C   = self._CANVAS
         dev = self.device
-
-        dirty = dirty.to(dev)
         Hi, Wi = dirty.shape
 
-        # Pad dirty to canvas; precompute its FFT once for all steps
         dirty_pad = F_.pad(dirty, (0, C - Wi, 0, C - Hi))            # (C, C)
         dirty_fft = torch.fft.rfft2(dirty_pad).unsqueeze(0)           # (1, C, C//2+1)
 
-        # All S trajectories start from independent Gaussian noise
-        x_t = torch.randn(S, 1, C, C, device=dev)
-
+        x_t    = torch.randn(S, 1, C, C, device=dev)
         dt     = 1.0 / self.n_steps
         sigma2 = self.noise_std ** 2
         net    = self.prior_model._net.eval().to(dev)
@@ -509,22 +503,59 @@ class DPSSolver:
                 x_hat_1 = x_t + (1.0 - t_val) * v                    # (S, 1, C, C)
 
                 # 3. Likelihood gradient: (1/σ²) · PSF^T * (dirty - PSF * x̂₁)
-                xhat_fft     = torch.fft.rfft2(x_hat_1[:, 0])        # (S, C, C//2+1)
-                pred_fft     = self._psf_fft * xhat_fft               # (S, C, C//2+1)
-                resid_fft    = dirty_fft - pred_fft                   # (S, C, C//2+1)
-                grad         = torch.fft.irfft2(
+                xhat_fft  = torch.fft.rfft2(x_hat_1[:, 0])           # (S, C, C//2+1)
+                pred_fft  = self._psf_fft * xhat_fft                  # (S, C, C//2+1)
+                resid_fft = dirty_fft - pred_fft                      # (S, C, C//2+1)
+                grad      = torch.fft.irfft2(
                     self._psf_fft_conj * resid_fft, s=(C, C)
-                )                                                      # (S, C, C)
-                grad         = grad.unsqueeze(1) / sigma2             # (S, 1, C, C)
+                ).unsqueeze(1) / sigma2                                # (S, 1, C, C)
 
                 # 4. Corrected Euler step
-                v_corrected = v + self.dps_weight * (1.0 - t_val) * grad
-                x_t         = x_t + dt * v_corrected
+                x_t = x_t + dt * (v + self.dps_weight * (1.0 - t_val) * grad)
 
-        x_clean = x_t[:, 0, :Hi, :Wi]                                # (S, Hi, Wi)
-        mean = x_clean.mean(dim=0)
-        std  = x_clean.std(dim=0) if S > 1 else torch.zeros_like(mean)
+        return x_t[:, 0, :Hi, :Wi]                                    # (S, Hi, Wi)
+
+    def sample(
+        self,
+        dirty    : torch.Tensor,
+        n_samples: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Draw n_samples posterior estimates; return (mean, std).
+
+        Parameters
+        ----------
+        dirty     : (H_i, W_i) float32 Tensor — observed dirty island
+        n_samples : override constructor n_samples if provided
+
+        Returns
+        -------
+        mean : (H_i, W_i) — posterior mean
+        std  : (H_i, W_i) — posterior std (zeros if n_samples == 1)
+        """
+        S       = n_samples if n_samples is not None else self.n_samples
+        x_clean = self._run_euler(dirty.to(self.device), S)
+        mean    = x_clean.mean(dim=0)
+        std     = x_clean.std(dim=0) if S > 1 else torch.zeros_like(mean)
         return mean, std
+
+    def sample_all(
+        self,
+        dirty    : torch.Tensor,
+        n_samples: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Draw n_samples from the posterior and return all individual draws.
+
+        Use this for TARP calibration and morphology confidence — both need
+        the full sample distribution, not just mean/std.
+
+        Returns
+        -------
+        samples : (S, H_i, W_i) — individual posterior draws
+        """
+        S = n_samples if n_samples is not None else self.n_samples
+        return self._run_euler(dirty.to(self.device), S)
 
     def decode_island(self, island: torch.Tensor) -> torch.Tensor:
         """FlowSolver-compatible interface: returns posterior mean."""
@@ -536,4 +567,101 @@ class DPSSolver:
                 f"n_samples={self.n_samples}, "
                 f"dps_weight={self.dps_weight}, "
                 f"noise_std={self.noise_std}, "
+                f"device={self.device})")
+
+
+# ── Phase 2 — Amortised Posterior Solver ─────────────────────────────────────
+
+class AmortisedSolver:
+    """
+    Island deconvolution via amortised posterior (Phase 2).
+
+    Replaces DPS's expensive N×50-step per-island sampling with a single
+    conditional flow q_φ(x_clean | dirty) trained to reproduce DPS posteriors.
+    At inference: N samples cost N × n_steps forward passes (default 20),
+    vs DPS's N × 50 — and with fewer steps because the dirty image is available
+    as conditioning, not just as a likelihood gradient correction.
+
+    Requires: ConditionalFlowModel trained via AmortisedPosteriorTrainer
+    (scripts/collect_dps_samples.py + scripts/train.py --variant Q).
+
+    Parameters
+    ----------
+    cond_model  : ConditionalFlowModel — trained on DPS posterior samples
+    device      : str
+    n_samples   : int   — posterior draws per island (default 8)
+    n_steps     : int   — Euler ODE steps (default 20; fewer than DPS's 50)
+    """
+
+    _CANVAS = 150
+    _variant_label = "C/Amortised"
+
+    def __init__(
+        self,
+        cond_model  : "ConditionalFlowModel",   # noqa: F821
+        device      : str = "cpu",
+        n_samples   : int = 8,
+        n_steps     : int = 20,
+    ):
+        self.cond_model = cond_model
+        self.device     = torch.device(device)
+        self.n_samples  = n_samples
+        self.n_steps    = n_steps
+
+    def _run_euler(
+        self,
+        dirty    : torch.Tensor,
+        n_samples: int,
+    ) -> torch.Tensor:
+        """Conditional Euler loop. Returns (S, H_i, W_i) posterior samples."""
+        S   = n_samples
+        C   = self._CANVAS
+        dev = self.device
+        Hi, Wi = dirty.shape
+
+        dirty_pad  = F_.pad(dirty.to(dev), (0, C - Wi, 0, C - Hi))   # (C, C)
+        dirty_cond = dirty_pad.unsqueeze(0).unsqueeze(0).expand(S, 1, C, C)  # (S,1,C,C)
+
+        x_t = torch.randn(S, 1, C, C, device=dev)
+        dt  = 1.0 / self.n_steps
+        net = self.cond_model._net.eval().to(dev)
+
+        with torch.no_grad():
+            for step_i in range(self.n_steps):
+                t_batch = torch.full((S,), step_i * dt, device=dev)
+                inp     = torch.cat([x_t, dirty_cond], dim=1)         # (S, 2, C, C)
+                v, _    = net(inp, t_batch)
+                x_t     = x_t + dt * v
+
+        return x_t[:, 0, :Hi, :Wi]                                    # (S, Hi, Wi)
+
+    def sample_all(
+        self,
+        dirty    : torch.Tensor,
+        n_samples: int | None = None,
+    ) -> torch.Tensor:
+        """Return all (S, H_i, W_i) posterior draws."""
+        S = n_samples if n_samples is not None else self.n_samples
+        return self._run_euler(dirty, S)
+
+    def sample(
+        self,
+        dirty    : torch.Tensor,
+        n_samples: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (mean, std), both (H_i, W_i)."""
+        x_clean = self.sample_all(dirty, n_samples)
+        S = x_clean.shape[0]
+        mean = x_clean.mean(dim=0)
+        std  = x_clean.std(dim=0) if S > 1 else torch.zeros_like(mean)
+        return mean, std
+
+    def decode_island(self, island: torch.Tensor) -> torch.Tensor:
+        """FlowSolver-compatible interface."""
+        mean, _ = self.sample(island)
+        return mean
+
+    def __repr__(self) -> str:
+        return (f"AmortisedSolver(n_steps={self.n_steps}, "
+                f"n_samples={self.n_samples}, "
                 f"device={self.device})")

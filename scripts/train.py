@@ -30,7 +30,11 @@ from pathlib import Path
 
 import numpy as np
 
-from mad_clean.training import PatchDictTrainer, ConvDictTrainer, FlowTrainer, PriorTrainer
+from mad_clean.training import (
+    PatchDictTrainer, ConvDictTrainer,
+    FlowTrainer, PriorTrainer,
+    AmortisedPosteriorTrainer,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,8 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Train a MAD-CLEAN filter bank or flow model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--variant",    required=True, choices=["A", "B", "C", "P"],
-                   help="A=patch OMP, B=CDL PSF-residual, C=flow matching, P=unconditional prior")
+    p.add_argument("--variant",    required=True, choices=["A", "B", "C", "P", "Q"],
+                   help="A=patch OMP, B=CDL PSF-residual, C=flow matching, "
+                        "P=unconditional prior, Q=amortised posterior (Phase 2)")
     p.add_argument("--data",       required=True,
                    help="Path to .npz with clean/dirty/psf keys")
     p.add_argument("--out",        required=True,
@@ -68,7 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr",     type=float, default=1e-4,
                    help="[C] Adam learning rate for FlowTrainer")
     p.add_argument("--resume", default=None,
-                   help="[C] Path to existing .pt checkpoint to resume from")
+                   help="[C/P/Q] Path to existing .pt checkpoint to resume from")
+    p.add_argument("--dps_samples", default="crumb_data/dps_samples.npz",
+                   help="[Q] Path to DPS posterior samples .npz "
+                        "(from scripts/collect_dps_samples.py)")
 
     return p
 
@@ -149,7 +157,7 @@ def main() -> None:
         fm = trainer.fit(dirty, clean, device=args.device, resume_from=args.resume)
         fm.save(out_path)
 
-    else:  # P
+    elif args.variant == "P":
         trainer = PriorTrainer(
             n_epochs   = args.n_epochs,
             batch_size = args.batch_size,
@@ -157,6 +165,19 @@ def main() -> None:
         )
         fm = trainer.fit(clean, device=args.device, resume_from=args.resume)
         fm.save(out_path)
+
+    else:  # Q — amortised posterior
+        trainer = AmortisedPosteriorTrainer(
+            n_epochs   = args.n_epochs,
+            batch_size = args.batch_size,
+            lr         = args.lr,
+        )
+        cfm = trainer.fit(
+            args.dps_samples,
+            device      = args.device,
+            resume_from = args.resume,
+        )
+        cfm.save(out_path)
 
     print(f"Done → {out_path}")
 
