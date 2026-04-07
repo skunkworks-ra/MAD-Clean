@@ -28,7 +28,7 @@ from .filters import FilterBank
 from ._utils import soft_threshold
 
 
-__all__ = ["PatchSolver", "ConvSolver", "FlowSolver"]
+__all__ = ["PatchSolver", "ConvSolver", "FlowSolver", "DPSSolver"]
 
 
 # ── Variant A — Patch Dictionary Solver ───────────────────────────────────────
@@ -358,12 +358,12 @@ class FlowSolver:
         with torch.no_grad():
             for step_i in range(self.n_steps):
                 t_batch = torch.full((S,), step_i * dt, device=dev)
-                v       = net(x_t, t_batch)
+                v, _    = net(x_t, t_batch)   # unpack (velocity, log_var)
                 x_t     = x_t + dt * v
 
         x_clean = x_t[:, 0, :Hi, :Wi]
         mean    = x_clean.mean(dim=0)
-        std     = x_clean.std(dim=0)
+        std     = x_clean.std(dim=0) if S > 1 else torch.zeros_like(mean)
         return mean, std
 
     def decode_island(self, island: torch.Tensor) -> torch.Tensor:
@@ -374,4 +374,166 @@ class FlowSolver:
         return (f"FlowSolver(n_samples={self.n_samples}, "
                 f"n_steps={self.n_steps}, "
                 f"perturb_std={self.perturb_std}, "
+                f"device={self.device})")
+
+
+# ── Variant C/DPS — Diffusion Posterior Sampling ──────────────────────────────
+
+class DPSSolver:
+    """
+    Island deconvolution via Diffusion Posterior Sampling (FlowDPS).
+
+    Samples from p(clean | dirty, PSF) by combining an unconditional flow prior
+    p(clean) (from PriorTrainer) with an explicit Gaussian likelihood gradient
+    injected at each Euler step (Kim et al., ICCV 2025 / Chung et al. 2022).
+
+    Algorithm (per Euler step, t: 0 → 1)
+    -------------------------------------
+    1. Prior velocity:  v = prior_model.velocity(x_t, t)
+    2. Tweedie estimate: x̂₁ = x_t + (1-t) · v
+    3. Likelihood grad:  ∇ = PSF^T * (dirty - PSF * x̂₁) / σ²
+                         [PSF^T = correlation = conjugate in FFT space]
+    4. Corrected step:   x_{t+dt} = x_t + dt · (v + ζ · (1-t) · ∇)
+                         [scale by (1-t): correction matters more near t=1]
+
+    x_t starts from pure Gaussian noise (matching PriorTrainer's starting distribution).
+    n_samples independent trajectories give a posterior mean and std.
+
+    Key hyperparameter: dps_weight ζ (default 1.0).
+    - Too high → reconstruction locked tightly to dirty (overfits PSF sidelobes)
+    - Too low  → prior dominates, flux_rec drifts away from 1.0
+    - Tune on validation: target flux_rec ≈ 1.0 ± 0.1
+
+    Parameters
+    ----------
+    prior_model : FlowModel — trained on clean images via PriorTrainer
+    psf_norm    : np.ndarray (H_p, W_p) — PSF with sum=1 (use data["psf_norm"])
+    noise_std   : float — estimated noise level in dirty image (default 0.05)
+    n_steps     : int   — Euler ODE steps (default 50)
+    n_samples   : int   — independent posterior draws (default 8)
+    dps_weight  : float — likelihood gradient scale ζ (default 1.0)
+    device      : str   — torch device string
+    """
+
+    _CANVAS = 150
+    _variant_label = "C/DPS"
+
+    def __init__(
+        self,
+        prior_model : "FlowModel",   # noqa: F821
+        psf_norm    : np.ndarray,
+        noise_std   : float = 0.05,
+        n_steps     : int   = 50,
+        n_samples   : int   = 8,
+        dps_weight  : float = 1.0,
+        device      : str   = "cpu",
+    ):
+        self.prior_model = prior_model
+        self.noise_std   = noise_std
+        self.n_steps     = n_steps
+        self.n_samples   = n_samples
+        self.dps_weight  = dps_weight
+        self.device      = torch.device(device)
+
+        # Pre-compute PSF FFT at canvas size — done once at init, reused per call.
+        C   = self._CANVAS
+        psf = torch.from_numpy(psf_norm).float()
+        pH, pW = psf.shape
+
+        # Crop PSF if larger than canvas
+        if pH > C:
+            ch  = (pH - C) // 2
+            psf = psf[ch : ch + C, :]
+            pH  = psf.shape[0]
+        if pW > C:
+            cw  = (pW - C) // 2
+            psf = psf[:, cw : cw + C]
+            pW  = psf.shape[1]
+
+        # Zero-pad to canvas, PSF centred
+        canvas = torch.zeros(C, C)
+        ph = (C - pH) // 2
+        pw = (C - pW) // 2
+        canvas[ph : ph + pH, pw : pw + pW] = psf
+
+        # ifftshift centres the PSF at the DC component before FFT
+        psf_fft = torch.fft.rfft2(torch.fft.ifftshift(canvas)).to(self.device)
+        self._psf_fft      = psf_fft          # forward: PSF * x̂₁
+        self._psf_fft_conj = psf_fft.conj()   # backward: PSF^T * r (correlation)
+
+    def sample(
+        self,
+        dirty    : torch.Tensor,
+        n_samples: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Draw n_samples posterior estimates of the clean image.
+
+        Parameters
+        ----------
+        dirty     : (H_i, W_i) float32 Tensor — observed dirty island
+        n_samples : override constructor n_samples if provided
+
+        Returns
+        -------
+        mean : (H_i, W_i) — posterior mean
+        std  : (H_i, W_i) — posterior std  (zeros if n_samples == 1)
+        """
+        S   = n_samples if n_samples is not None else self.n_samples
+        C   = self._CANVAS
+        dev = self.device
+
+        dirty = dirty.to(dev)
+        Hi, Wi = dirty.shape
+
+        # Pad dirty to canvas; precompute its FFT once for all steps
+        dirty_pad = F_.pad(dirty, (0, C - Wi, 0, C - Hi))            # (C, C)
+        dirty_fft = torch.fft.rfft2(dirty_pad).unsqueeze(0)           # (1, C, C//2+1)
+
+        # All S trajectories start from independent Gaussian noise
+        x_t = torch.randn(S, 1, C, C, device=dev)
+
+        dt     = 1.0 / self.n_steps
+        sigma2 = self.noise_std ** 2
+        net    = self.prior_model._net.eval().to(dev)
+
+        with torch.no_grad():
+            for step_i in range(self.n_steps):
+                t_val   = step_i * dt
+                t_batch = torch.full((S,), t_val, device=dev)
+
+                # 1. Prior velocity
+                v, _ = net(x_t, t_batch)                              # (S, 1, C, C)
+
+                # 2. Tweedie estimate of x₁
+                x_hat_1 = x_t + (1.0 - t_val) * v                    # (S, 1, C, C)
+
+                # 3. Likelihood gradient: (1/σ²) · PSF^T * (dirty - PSF * x̂₁)
+                xhat_fft     = torch.fft.rfft2(x_hat_1[:, 0])        # (S, C, C//2+1)
+                pred_fft     = self._psf_fft * xhat_fft               # (S, C, C//2+1)
+                resid_fft    = dirty_fft - pred_fft                   # (S, C, C//2+1)
+                grad         = torch.fft.irfft2(
+                    self._psf_fft_conj * resid_fft, s=(C, C)
+                )                                                      # (S, C, C)
+                grad         = grad.unsqueeze(1) / sigma2             # (S, 1, C, C)
+
+                # 4. Corrected Euler step
+                v_corrected = v + self.dps_weight * (1.0 - t_val) * grad
+                x_t         = x_t + dt * v_corrected
+
+        x_clean = x_t[:, 0, :Hi, :Wi]                                # (S, Hi, Wi)
+        mean = x_clean.mean(dim=0)
+        std  = x_clean.std(dim=0) if S > 1 else torch.zeros_like(mean)
+        return mean, std
+
+    def decode_island(self, island: torch.Tensor) -> torch.Tensor:
+        """FlowSolver-compatible interface: returns posterior mean."""
+        mean, _ = self.sample(island, n_samples=self.n_samples)
+        return mean
+
+    def __repr__(self) -> str:
+        return (f"DPSSolver(n_steps={self.n_steps}, "
+                f"n_samples={self.n_samples}, "
+                f"dps_weight={self.dps_weight}, "
+                f"noise_std={self.noise_std}, "
                 f"device={self.device})")
