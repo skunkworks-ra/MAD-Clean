@@ -9,21 +9,30 @@ straight-line path from dirty to clean.  At inference, the Euler ODE starts
 from the dirty island and integrates to t=1 to produce the clean sky estimate.
 No PSF is required at inference — the PSF is implicit in the training data.
 
+Uncertainty (Component B — heteroscedastic head)
+------------------------------------------------
+UNetVelocityField outputs both a velocity field and a log-variance field from
+two parallel 1×1 conv heads sharing all encoder/decoder features.  Training uses
+the heteroscedastic NLL loss (Kendall & Gal 2017) so the model jointly learns
+the mean direction and its confidence.  At inference, FlowModel.uncertainty_map()
+evaluates at t=0 to return (μ_clean, σ_clean) per pixel in a single forward pass.
+
 Classes
 -------
 UNetVelocityField
-    Lightweight U-Net (~1–4M params).  Input: image + time embedding.
-    Output: velocity field, same spatial size as input.
+    Lightweight U-Net (~2.5M params).  Input: image + time embedding.
+    Output: (velocity, log_var) — both (B, 1, H, W).
 
 FlowModel
     Thin wrapper around UNetVelocityField.
-    save(path)                → writes state dict to .pt file
-    load(path, device)        → class method, returns FlowModel
-    velocity(x, t) → Tensor  → evaluates v_θ(x, t)
+    save(path)                       → writes state dict to .pt file
+    load(path, device)               → class method, returns FlowModel
+    velocity(x, t) → Tensor         → mean velocity v_θ(x, t)
+    uncertainty_map(dirty) → (μ, σ) → per-pixel clean estimate + std, single pass
 
 FlowTrainer
     fit(dirty, clean, device) → FlowModel
-    Trains dirty→clean CFM with 8-fold on-the-fly augmentation.
+    Trains dirty→clean CFM with heteroscedastic NLL loss and 8-fold augmentation.
     Expects PSF-area-normalised inputs from SimulateObservations.
 """
 
@@ -39,7 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F_
 
 
-__all__ = ["UNetVelocityField", "FlowModel", "FlowTrainer"]
+__all__ = ["UNetVelocityField", "FlowModel", "FlowTrainer", "PriorTrainer"]
 
 
 # ---------------------------------------------------------------------------
@@ -99,14 +108,13 @@ class _Downsample(nn.Module):
 
 
 class _Upsample(nn.Module):
-    """2× bilinear upsample followed by 1×1 conv to fix channels."""
+    """2× learned upsample via transposed conv (avoids bilinear blur artefacts)."""
 
     def __init__(self, ch: int):
         super().__init__()
-        self.conv = nn.Conv2d(ch, ch, 1)
+        self.conv = nn.ConvTranspose2d(ch, ch, kernel_size=2, stride=2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F_.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
         return self.conv(x)
 
 
@@ -164,10 +172,13 @@ class UNetVelocityField(nn.Module):
         self.up1   = _Upsample(64)               # (B, 64,  150, 150)
         self.dec1  = _ConvBlock(64 + 32, 32, td)    # (B, 32,  150, 150)
 
-        # Output projection
-        self.head  = nn.Conv2d(32, 1, 1)
+        # Output projection — two parallel heads share all decoder features
+        self.head     = nn.Conv2d(32, 1, 1)   # mean velocity
+        self.var_head = nn.Conv2d(32, 1, 1)   # log-variance of velocity
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, t: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
@@ -176,7 +187,8 @@ class UNetVelocityField(nn.Module):
 
         Returns
         -------
-        v : (B, 1, H, W)  — velocity field
+        v       : (B, 1, H, W)  — mean velocity field
+        log_var : (B, 1, H, W)  — log-variance of velocity (unclamped)
         """
         temb = _sinusoidal_embedding(t, self.TIME_DIM)
         temb = self.time_mlp(temb)  # (B, TIME_DIM)
@@ -197,7 +209,7 @@ class UNetVelocityField(nn.Module):
         d1   = F_.interpolate(d1, size=e1.shape[2:], mode="bilinear", align_corners=False)
         d1   = self.dec1(torch.cat([d1, e1], dim=1), temb)        # (B, 32, H, W)
 
-        return self.head(d1)                                       # (B, 1, H, W)
+        return self.head(d1), self.var_head(d1)                    # both (B, 1, H, W)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +237,7 @@ class FlowModel:
     # ------------------------------------------------------------------
     def velocity(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        Evaluate v_θ(x, t).
+        Evaluate mean velocity v_θ(x, t).
 
         Parameters
         ----------
@@ -240,7 +252,41 @@ class FlowModel:
         x = x.to(self.device)
         t = t.to(self.device)
         with torch.no_grad():
-            return self._net(x, t)
+            v, _ = self._net(x, t)
+            return v
+
+    # ------------------------------------------------------------------
+    def uncertainty_map(
+        self, dirty: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Per-pixel (mean_clean, sigma_clean) in a single forward pass at t=0.
+
+        Evaluates the model at t=0 where x_t = x_0 (the dirty image).
+        The initial velocity uncertainty is a direct proxy for clean image
+        uncertainty: the model's confidence about the direction dirty→clean
+        at the starting point maps onto uncertainty in the final clean estimate.
+
+        A single Euler step (μ = dirty + v) gives the mean clean estimate.
+        σ = exp(0.5 * clamp(log_var, -10, 10)) gives the per-pixel std.
+
+        Parameters
+        ----------
+        dirty : (B, 1, H, W) float32 Tensor
+
+        Returns
+        -------
+        mu    : (B, 1, H, W) — mean clean estimate
+        sigma : (B, 1, H, W) — per-pixel std of clean estimate
+        """
+        self._net.eval()
+        dirty = dirty.to(self.device)
+        t = torch.zeros(dirty.shape[0], device=self.device)
+        with torch.no_grad():
+            v, log_var = self._net(dirty, t)
+            mu    = dirty + v
+            sigma = (0.5 * log_var.clamp(-10, 10)).exp()
+        return mu, sigma
 
     # ------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
@@ -264,13 +310,21 @@ class FlowModel:
         path   : path to the .pt file written by FlowModel.save()
         device : override device (defaults to device stored in the file)
         """
-        path      = Path(path)
-        ckpt      = torch.load(path, map_location="cpu", weights_only=True)
-        dev       = device if device is not None else ckpt.get("device", "cpu")
-        fm        = cls(device=dev)
-        fm._net.load_state_dict(ckpt["state_dict"])
+        path = Path(path)
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        dev  = device if device is not None else ckpt.get("device", "cpu")
+        fm   = cls(device=dev)
+        missing, unexpected = fm._net.load_state_dict(
+            ckpt["state_dict"], strict=False
+        )
+        if missing:
+            # Old deterministic checkpoint: var_head missing — random init.
+            # Warm-start: velocity head loaded, var_head trains from scratch.
+            print(f"FlowModel loaded ← {path}  (device={dev})  "
+                  f"[warm-start: {len(missing)} keys missing — var_head randomly initialised]")
+        else:
+            print(f"FlowModel loaded ← {path}  (device={dev})")
         fm._net.eval()
-        print(f"FlowModel loaded ← {path}  (device={dev})")
         return fm
 
     def __repr__(self) -> str:
@@ -299,6 +353,19 @@ def _augment_pair(
         dirty = np.fliplr(dirty)
         clean = np.fliplr(clean)
     return np.ascontiguousarray(dirty), np.ascontiguousarray(clean)
+
+
+def _augment_single(
+    img: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Apply a random D4 transform (4 rotations × optional flip) to a single image."""
+    k    = int(rng.integers(0, 4))
+    flip = bool(rng.integers(0, 2))
+    img  = np.rot90(img, k=k)
+    if flip:
+        img = np.fliplr(img)
+    return np.ascontiguousarray(img)
 
 
 class FlowTrainer:
@@ -398,20 +465,150 @@ class FlowTrainer:
                 u_target = x1 - x0                       # velocity: dirty → clean
 
                 optimizer.zero_grad()
-                v_pred = fm._net(x_t, t)
-                loss   = 0.5 * ((v_pred - u_target) ** 2).mean()
+                v_pred, log_var = fm._net(x_t, t)
+                log_var = log_var.clamp(-10, 10)
+                # Heteroscedastic NLL (Kendall & Gal 2017):
+                #   L = 0.5 * [ (v - u)² / exp(log_var) + log_var ]
+                # exp(log_var) penalises overconfidence; log_var penalises underconfidence.
+                # Optimal: log_var ≈ log((v_pred - u_target)²).
+                loss = 0.5 * (
+                    (v_pred - u_target) ** 2 / log_var.exp() + log_var
+                ).mean()
                 loss.backward()
                 optimizer.step()
 
                 epoch_loss += float(loss)
                 n_batches  += 1
 
+            mean_sigma = log_var.detach().mul(0.5).exp().mean().item()
             print(f"  Epoch {epoch + 1:3d}/{self.n_epochs}  "
-                  f"loss={epoch_loss / n_batches:.3e}", flush=True)
+                  f"loss={epoch_loss / n_batches:.3e}  "
+                  f"mean_sigma={mean_sigma:.3f}", flush=True)
 
         fm._net.eval()
         return fm
 
     def __repr__(self) -> str:
         return (f"FlowTrainer(n_epochs={self.n_epochs}, "
+                f"batch_size={self.batch_size}, lr={self.lr})")
+
+
+# ---------------------------------------------------------------------------
+# PR-1: PriorTrainer — unconditional CFM on clean images only
+# ---------------------------------------------------------------------------
+
+class PriorTrainer:
+    """
+    Train a FlowModel as an unconditional prior p(clean) using CFM.
+
+    Unlike FlowTrainer (which maps dirty→clean), PriorTrainer maps noise→clean.
+    The resulting model encodes source morphology without any PSF structure —
+    it is fully instrument-agnostic and can be coupled to any PSF at inference
+    via the likelihood gradient (see DPSSolver in solvers.py).
+
+    Algorithm (per minibatch)
+    -------------------------
+    1. x0 = N(0, 1)  — pure Gaussian noise (no dirty image)
+       x1 = clean image
+    2. Draw t ~ U[0, 1]  (B,)
+    3. Interpolate: x_t = (1 − t) · x0 + t · x1
+    4. Target velocity: u = x1 − x0  (straight path from noise to clean)
+    5. Heteroscedastic NLL loss (Kendall & Gal 2017):
+           L = 0.5 * [ (v − u)² / exp(log_var) + log_var ]
+    6. Adam step
+
+    Parameters
+    ----------
+    n_epochs   : int    (default 500)
+    batch_size : int    (default 16)
+    lr         : float  Adam learning rate (default 1e-4)
+    random_seed: int    (default 42)
+    """
+
+    def __init__(
+        self,
+        n_epochs   : int   = 500,
+        batch_size : int   = 16,
+        lr         : float = 1e-4,
+        random_seed: int   = 42,
+    ):
+        self.n_epochs    = n_epochs
+        self.batch_size  = batch_size
+        self.lr          = lr
+        self.random_seed = random_seed
+
+    def fit(
+        self,
+        clean       : np.ndarray,
+        device      : str = "cpu",
+        resume_from : Optional[str | Path] = None,
+    ) -> FlowModel:
+        """
+        Train on (N, H, W) clean float32 images — no dirty images needed.
+
+        Parameters
+        ----------
+        clean       : np.ndarray (N, H, W) float32 — ground truth sky images
+        device      : torch device string
+        resume_from : path to an existing .pt checkpoint to resume from.
+                      Loads weights before training; n_epochs additional epochs run.
+        """
+        dev = torch.device(device)
+        rng = np.random.default_rng(self.random_seed)
+        N, H, W = clean.shape
+
+        if resume_from is not None:
+            fm = FlowModel.load(resume_from, device=device)
+            print(f"Resuming from {resume_from} — running {self.n_epochs} additional epochs")
+        else:
+            fm = FlowModel(device=device)
+        optimizer = torch.optim.Adam(fm._net.parameters(), lr=self.lr)
+
+        print(f"PriorTrainer (noise→clean): N={N}  {H}×{W}  "
+              f"batch={self.batch_size}  epochs={self.n_epochs}  device={dev}")
+
+        for epoch in range(self.n_epochs):
+            idx        = rng.permutation(N)
+            epoch_loss = 0.0
+            n_batches  = 0
+
+            fm._net.train()
+            for b_start in range(0, N, self.batch_size):
+                batch_idx = idx[b_start : b_start + self.batch_size]
+
+                clean_aug = [_augment_single(clean[i], rng) for i in batch_idx]
+                clean_np  = np.stack(clean_aug)   # (B, H, W)
+
+                x1 = torch.from_numpy(clean_np[:, None]).float().to(dev)  # (B,1,H,W)
+                x0 = torch.randn_like(x1)                                   # pure noise
+                B  = x1.shape[0]
+
+                t  = torch.rand(B, device=dev)
+                t4 = t[:, None, None, None]
+
+                x_t      = (1.0 - t4) * x0 + t4 * x1   # noise → clean interpolant
+                u_target = x1 - x0                       # velocity: noise → clean
+
+                optimizer.zero_grad()
+                v_pred, log_var = fm._net(x_t, t)
+                log_var = log_var.clamp(-10, 10)
+                loss = 0.5 * (
+                    (v_pred - u_target) ** 2 / log_var.exp() + log_var
+                ).mean()
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += float(loss)
+                n_batches  += 1
+
+            mean_sigma = log_var.detach().mul(0.5).exp().mean().item()
+            print(f"  Epoch {epoch + 1:3d}/{self.n_epochs}  "
+                  f"loss={epoch_loss / n_batches:.3e}  "
+                  f"mean_sigma={mean_sigma:.3f}", flush=True)
+
+        fm._net.eval()
+        return fm
+
+    def __repr__(self) -> str:
+        return (f"PriorTrainer(n_epochs={self.n_epochs}, "
                 f"batch_size={self.batch_size}, lr={self.lr})")

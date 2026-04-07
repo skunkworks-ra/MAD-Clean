@@ -14,6 +14,10 @@ Variant C  (conditional flow matching):
     mad-train --variant C --data crumb_data/flow_pairs.npz \\
         --out models/flow_model.pt [--resume models/flow_model.pt] [--device cuda]
 
+Variant P  (unconditional prior — clean images only):
+    mad-train --variant P --data crumb_data/flow_pairs_vla.npz \\
+        --out models/prior_model.pt [--n_epochs 500] [--batch_size 16] [--device cuda]
+
 The --data file must be a .npz produced by scripts/simulate.py, with keys:
     clean     (N, H, W) float32
     dirty     (N, H, W) float32
@@ -26,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-from mad_clean.training import PatchDictTrainer, ConvDictTrainer, FlowTrainer
+from mad_clean.training import PatchDictTrainer, ConvDictTrainer, FlowTrainer, PriorTrainer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,8 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Train a MAD-CLEAN filter bank or flow model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--variant",    required=True, choices=["A", "B", "C"],
-                   help="A=patch OMP, B=CDL PSF-residual, C=flow matching")
+    p.add_argument("--variant",    required=True, choices=["A", "B", "C", "P"],
+                   help="A=patch OMP, B=CDL PSF-residual, C=flow matching, P=unconditional prior")
     p.add_argument("--data",       required=True,
                    help="Path to .npz with clean/dirty/psf keys")
     p.add_argument("--out",        required=True,
@@ -132,7 +136,7 @@ def main() -> None:
         fb = trainer.fit(dirty, psf, device=args.device)
         trainer.save(out_path, fb)
 
-    else:  # C
+    elif args.variant == "C":
         if dirty is None:
             print("ERROR: --variant C requires dirty images. Run scripts/simulate.py first.",
                   file=sys.stderr)
@@ -143,6 +147,15 @@ def main() -> None:
             lr         = args.lr,
         )
         fm = trainer.fit(dirty, clean, device=args.device, resume_from=args.resume)
+        fm.save(out_path)
+
+    else:  # P
+        trainer = PriorTrainer(
+            n_epochs   = args.n_epochs,
+            batch_size = args.batch_size,
+            lr         = args.lr,
+        )
+        fm = trainer.fit(clean, device=args.device, resume_from=args.resume)
         fm.save(out_path)
 
     print(f"Done → {out_path}")
