@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
+from mad_clean.data.simulate import _make_gaussian_psf, _load_psf
 from mad_clean.data.simulator import GPUSimulator
 from mad_clean.training import (
     PatchDictTrainer, ConvDictTrainer,
@@ -81,6 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--lr",             type=float, default=1e-4,
                    help="[C/P] Adam learning rate for FlowTrainer / PriorTrainer")
+    p.add_argument("--psf",            default=None,
+                   help="[C/P] Path to PSF file (.npz with 'psf' key, .npy, or .fits)")
+    p.add_argument("--psf_fwhm",       type=float, default=None,
+                   help="[C/P] Synthetic Gaussian PSF FWHM in pixels (mutually exclusive with --psf)")
     p.add_argument("--vram_budget_gb", type=float, default=32.0,
                    help="[C/P] GPU VRAM budget in GB for GPUSimulator batch sizing")
     p.add_argument("--noise_std",      type=float, default=0.05,
@@ -96,6 +101,26 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[V] KL weight in VAE loss")
 
     return p
+
+
+def _resolve_psf(args, image_shape: tuple) -> np.ndarray:
+    """Load or synthesise a peak=1 PSF for variants C and P."""
+    H, W = image_shape
+    if args.psf is not None and args.psf_fwhm is not None:
+        print("ERROR: --psf and --psf_fwhm are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+    if args.psf is not None:
+        return _load_psf(args.psf, target_shape=(H, W))
+    if args.psf_fwhm is not None:
+        psf = _make_gaussian_psf(args.psf_fwhm, size=max(H, W))
+        return psf[:H, :W]
+    # Try loading from the data npz itself
+    data = np.load(args.data)
+    if "psf" in data:
+        return data["psf"].astype(np.float32)
+    print("ERROR: --variant C/P requires a PSF. Provide --psf <file> or --psf_fwhm <pixels>",
+          file=sys.stderr)
+    sys.exit(1)
 
 
 def main() -> None:
@@ -166,11 +191,8 @@ def main() -> None:
         trainer.save(out_path, fb)
 
     elif args.variant == "C":
-        if "psf" not in data:
-            print("ERROR: --variant C requires a 'psf' key in the .npz data file.",
-                  file=sys.stderr)
-            sys.exit(1)
-        psf = data["psf"].astype(np.float32)
+        H, W = clean.shape[1], clean.shape[2]
+        psf = _resolve_psf(args, image_shape=(H, W))
         simulator = GPUSimulator(
             data_path      = data_path,
             psf            = psf,
@@ -184,11 +206,8 @@ def main() -> None:
         fm.save(out_path)
 
     elif args.variant == "P":
-        if "psf" not in data:
-            print("ERROR: --variant P requires a 'psf' key in the .npz data file.",
-                  file=sys.stderr)
-            sys.exit(1)
-        psf = data["psf"].astype(np.float32)
+        H, W = clean.shape[1], clean.shape[2]
+        psf = _resolve_psf(args, image_shape=(H, W))
         simulator = GPUSimulator(
             data_path      = data_path,
             psf            = psf,
