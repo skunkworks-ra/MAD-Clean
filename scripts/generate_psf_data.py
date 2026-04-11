@@ -68,15 +68,14 @@ def _generate_one(args: tuple) -> str:
     ).astype(np.float32)
     dirty  += rng.standard_normal(dirty.shape).astype(np.float32) * noise_std
 
-    out_path = Path(out_dir) / f"psf_{p_idx:04d}.npz"
-    np.savez_compressed(
-        out_path,
-        dirty  = dirty,
-        clean  = cleans,
-        psf    = psf,
-        params = np.array([params["fwhm_maj"], params["fwhm_min"], params["pa"]],
-                          dtype=np.float32),
-    )
+    import torch
+    out_path = Path(out_dir) / f"psf_{p_idx:04d}.pt"
+    torch.save({
+        "dirty" : torch.from_numpy(dirty),
+        "clean" : torch.from_numpy(cleans),
+        "psf"   : torch.from_numpy(psf),
+        "params": torch.tensor([params["fwhm_maj"], params["fwhm_min"], params["pa"]]),
+    }, out_path)
     return f"PSF {p_idx:4d}  fwhm={params['fwhm_maj']:.1f}×{params['fwhm_min']:.1f}  pa={params['pa']:3d}°  → {out_path.name}"
 
 

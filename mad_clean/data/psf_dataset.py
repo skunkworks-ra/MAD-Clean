@@ -34,6 +34,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+
 __all__ = ["PSFPairsDataset"]
 
 
@@ -66,17 +67,18 @@ class PSFPairsDataset(Dataset):
         psf_idx   = int(self._psf_indices[psf_slot])
 
         data  = self._load_psf_file(psf_idx)
-        dirty = torch.from_numpy(data["dirty"][img_slot])   # (H, W)
-        clean = torch.from_numpy(data["clean"][img_slot])   # (H, W)
-        psf   = torch.from_numpy(data["psf"])               # (H, W)
+        dirty = data["dirty"][img_slot]   # (H, W) tensor
+        clean = data["clean"][img_slot]   # (H, W) tensor
+        psf   = data["psf"]              # (H, W) tensor
 
         return dirty, psf, clean
 
     @lru_cache(maxsize=8)
     def _load_psf_file(self, psf_idx: int) -> dict:
-        """Load and cache a PSF npz file. LRU cache keeps 8 files open."""
-        path = self.root / f"psf_{psf_idx:04d}.npz"
-        data = np.load(path)
+        """Load and cache a PSF .pt file. LRU cache keeps 8 files open."""
+        import torch
+        path = self.root / f"psf_{psf_idx:04d}.pt"
+        data = torch.load(path, map_location="cpu", weights_only=True)
         return {
             "dirty": data["dirty"],   # (N_img, H, W) float32
             "clean": data["clean"],   # (N_img, H, W) float32

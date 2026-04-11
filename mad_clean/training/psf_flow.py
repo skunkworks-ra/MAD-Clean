@@ -218,6 +218,8 @@ class PSFFlowModel:
         """
         Euler ODE from dirty → clean conditioned on psf.
 
+        The PSF channel is fixed throughout. Only the image channel evolves.
+
         Parameters
         ----------
         dirty   : (H, W) float32 Tensor
@@ -228,22 +230,22 @@ class PSFFlowModel:
         -------
         clean_hat : (H, W) float32 Tensor
         """
-        H, W = dirty.shape
-        dev  = self.device
-        x    = torch.stack([dirty, psf], dim=0).unsqueeze(0).to(dev)  # (1, 2, H, W)
-        dt   = 1.0 / n_steps
-        net  = self._net.eval()
+        dev = self.device
+        net = self._net.eval()
+        dt  = 1.0 / n_steps
+
+        # Image channel evolves; PSF channel is fixed
+        x_img = dirty.unsqueeze(0).unsqueeze(0).to(dev)   # (1, 1, H, W)
+        p     = psf.unsqueeze(0).unsqueeze(0).to(dev)     # (1, 1, H, W)
 
         with torch.no_grad():
             for step in range(n_steps):
                 t_batch = torch.full((1,), step * dt, device=dev)
-                v, _    = net(x, t_batch)
-                x       = x + dt * torch.cat([v, torch.zeros_like(v)], dim=1)
-                # Only update the dirty channel; PSF channel is fixed
-                # More precisely: only the dirty channel evolves along the ODE
+                x_in    = torch.cat([x_img, p], dim=1)    # (1, 2, H, W)
+                v, _    = net(x_in, t_batch)               # (1, 1, H, W)
+                x_img   = x_img + dt * v
 
-        # Cleaner: track only the dirty channel through the ODE
-        return x[0, 0]   # (H, W)
+        return x_img[0, 0]   # (H, W)
 
 
 # ---------------------------------------------------------------------------
