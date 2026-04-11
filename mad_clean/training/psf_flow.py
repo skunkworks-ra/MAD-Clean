@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F_
+from torch.utils.data import DataLoader
 
 __all__ = ["PSFFlowModel", "PSFFlowTrainer"]
 
@@ -283,27 +284,25 @@ class PSFFlowTrainer:
 
     def fit(
         self,
-        dirty      : np.ndarray,       # (N, H, W) float32
-        psf        : np.ndarray,       # (N, H, W) float32  — one PSF per sample
-        clean      : np.ndarray,       # (N, H, W) float32
-        train_mask : np.ndarray,       # (N,) bool — True = training sample
-        device     : str         = "cpu",
-        resume_from: str | None  = None,
-        out_path   : str | Path | None = None,
+        data_root   : str | Path,
+        device      : str        = "cpu",
+        resume_from : str | None = None,
+        out_path    : str | Path | None = None,
+        num_workers : int        = 4,
     ) -> "PSFFlowModel":
         """
         Train and return a PSFFlowModel.
 
         Parameters
         ----------
-        dirty      : (N, H, W) dirty images
-        psf        : (N, H, W) PSF for each sample (peak=1)
-        clean      : (N, H, W) clean sky images
-        train_mask : (N,) bool — use only True entries for training
-        device     : 'cpu' or 'cuda'
-        resume_from: optional checkpoint path to warm-start from
-        out_path   : if provided, save best checkpoint here during training
+        data_root   : path to psf_pairs/ directory (from generate_psf_data.py)
+        device      : 'cpu' or 'cuda'
+        resume_from : optional checkpoint path to warm-start from
+        out_path    : save best checkpoint here during training
+        num_workers : DataLoader worker processes
         """
+        from mad_clean.data.psf_dataset import PSFPairsDataset
+
         dev   = torch.device(device)
         model = PSFFlowModel(device=device)
 
@@ -313,51 +312,41 @@ class PSFFlowTrainer:
             )
             print(f"Resumed from {resume_from}")
 
-        # Training split
-        idx   = np.where(train_mask)[0]
-        N     = len(idx)
-        H, W  = clean.shape[1], clean.shape[2]
-        print(f"PSFFlowTrainer: {N} training pairs  {H}×{W}  "
+        dataset = PSFPairsDataset(data_root, train=True)
+        loader  = DataLoader(
+            dataset,
+            batch_size  = self.batch_size,
+            shuffle     = True,
+            num_workers = num_workers,
+            pin_memory  = (device == "cuda"),
+        )
+
+        print(f"PSFFlowTrainer: {len(dataset):,} training pairs  "
               f"batch={self.batch_size}  epochs={self.n_epochs}  device={device}")
 
-        dirty_t = torch.from_numpy(dirty[idx]).float()   # (N, H, W)
-        psf_t   = torch.from_numpy(psf[idx]).float()     # (N, H, W)
-        clean_t = torch.from_numpy(clean[idx]).float()   # (N, H, W)
-
-        opt      = torch.optim.Adam(model._net.parameters(), lr=self.lr)
+        opt       = torch.optim.Adam(model._net.parameters(), lr=self.lr)
         best_loss = float("inf")
-        rng      = np.random.default_rng(0)
 
         for epoch in range(1, self.n_epochs + 1):
             model._net.train()
-            perm       = rng.permutation(N)
             epoch_loss = 0.0
             n_batches  = 0
 
-            for start in range(0, N, self.batch_size):
-                bidx = perm[start : start + self.batch_size]
+            for dirty, psf, clean in loader:
+                x0 = dirty.to(dev)   # (B, H, W)
+                x1 = clean.to(dev)
+                p  = psf.to(dev)
 
-                x0 = dirty_t[bidx].to(dev)          # (B, H, W)
-                x1 = clean_t[bidx].to(dev)
-                p  = psf_t[bidx].to(dev)
-
-                # Sample time
-                t  = torch.rand(len(bidx), device=dev)
-
-                # Interpolate
+                t  = torch.rand(x0.shape[0], device=dev)
                 t4 = t[:, None, None]
-                xt = (1 - t4) * x0 + t4 * x1        # (B, H, W)
-                u  = x1 - x0                         # target velocity
+                xt = (1 - t4) * x0 + t4 * x1
+                u  = x1 - x0
 
-                # 2-channel input: [x_t, psf]
-                x_in = torch.stack([xt, p], dim=1)   # (B, 2, H, W)
+                x_in = torch.stack([xt, p], dim=1)        # (B, 2, H, W)
 
-                v, log_var = model._net(x_in, t)     # (B, 1, H, W)
-                v       = v.squeeze(1)               # (B, H, W)
-                log_var = log_var.squeeze(1)
-
-                # Heteroscedastic NLL loss
-                log_var = log_var.clamp(-10, 10)
+                v, log_var = model._net(x_in, t)
+                v       = v.squeeze(1)
+                log_var = log_var.squeeze(1).clamp(-10, 10)
                 loss    = (0.5 * (u - v) ** 2 * torch.exp(-log_var)
                            + 0.5 * log_var).mean()
 

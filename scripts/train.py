@@ -97,11 +97,14 @@ def main() -> None:
         print(f"ERROR: data file not found: {data_path}", file=sys.stderr)
         sys.exit(1)
 
-    data = np.load(data_path)
+    # Variant PSF reads from a directory via Dataset — skip npz loading
+    data = None
+    if args.variant != "PSF":
+        data = np.load(data_path)
 
     # Variant Q uses z_codes directly — skip image loading
     clean = dirty = None
-    if args.variant != "Q":
+    if args.variant not in ("Q", "PSF"):
         if "clean" in data:
             clean = data["clean"].astype(np.float32)
             dirty = data["dirty"].astype(np.float32) if "dirty" in data else None
@@ -205,22 +208,18 @@ def main() -> None:
         lf.save(out_path)
 
     elif args.variant == "PSF":
-        if "psf" not in data or "train_mask" not in data:
-            print("ERROR: --variant PSF requires psf_pairs.npz from scripts/generate_psf_data.py",
+        # --data should point to the psf_pairs/ directory
+        if not (data_path / "index.npz").exists():
+            print("ERROR: --data must be the psf_pairs/ directory from generate_psf_data.py",
                   file=sys.stderr)
             sys.exit(1)
-        psf_arr    = data["psf"].astype(np.float32)
-        train_mask = data["train_mask"]
         trainer = PSFFlowTrainer(
             n_epochs   = args.n_epochs,
             batch_size = args.batch_size,
             lr         = args.lr,
         )
         fm = trainer.fit(
-            dirty       = dirty,
-            psf         = psf_arr,
-            clean       = clean,
-            train_mask  = train_mask,
+            data_root   = data_path,
             device      = args.device,
             resume_from = args.resume,
             out_path    = out_path,
