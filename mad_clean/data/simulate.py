@@ -86,20 +86,30 @@ def _load_psf(path: str | Path, target_shape: tuple) -> np.ndarray:
     return data
 
 
+def _next_pow2(n: int) -> int:
+    """Smallest power of 2 that is ≥ n."""
+    return 1 << (n - 1).bit_length()
+
+
 def _convolve_psf(images: np.ndarray, psf: np.ndarray) -> np.ndarray:
     """
-    Convolve each image in (N, H, W) with the PSF (H, W) via FFT.
+    Convolve each image in (N, H, W) with the PSF (H, W) via padded FFT.
 
-    The PSF peak is at (H//2, W//2). ifftshift moves it to (0, 0) before FFT
-    so the convolution is non-circular — consistent with MADClean's convention.
+    Padding to the next power-of-2 ≥ 2×max(H,W) converts circular convolution
+    to linear convolution — no wrap-around artifacts at image boundaries.
+    ifftshift moves the PSF peak from (H//2, W//2) to (0, 0) before the FFT,
+    consistent with MADClean's PSF convention (peak=1 at centre).
+    Output is cropped back to (H, W).
     """
-    H, W = images.shape[1], images.shape[2]
+    H, W  = images.shape[1], images.shape[2]
+    pad   = _next_pow2(2 * max(H, W))
+
     psf_shifted = np.fft.ifftshift(psf)
-    psf_fft     = np.fft.rfft2(psf_shifted, s=(H, W))
-    imgs_fft    = np.fft.rfft2(images, axes=(1, 2))
+    psf_fft     = np.fft.rfft2(psf_shifted, s=(pad, pad))
+    imgs_fft    = np.fft.rfft2(images, s=(pad, pad), axes=(1, 2))
     dirty_fft   = imgs_fft * psf_fft[None, :, :]
-    dirty       = np.fft.irfft2(dirty_fft, s=(H, W), axes=(1, 2))
-    return dirty.astype(np.float32)
+    dirty_pad   = np.fft.irfft2(dirty_fft, s=(pad, pad), axes=(1, 2))
+    return dirty_pad[:, :H, :W].astype(np.float32)
 
 
 class SimulateObservations:

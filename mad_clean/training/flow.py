@@ -40,12 +40,14 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F_
+
+if TYPE_CHECKING:
+    from mad_clean.data.simulator import GPUSimulator
 
 
 __all__ = ["UNetVelocityField", "FlowModel", "FlowTrainer", "PriorTrainer"]
@@ -336,37 +338,6 @@ class FlowModel:
 # CR-2: FlowTrainer — conditional dirty→clean CFM
 # ---------------------------------------------------------------------------
 
-def _augment_pair(
-    dirty: np.ndarray,
-    clean: np.ndarray,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Apply the same random D4 transform (4 rotations × optional flip) to a
-    dirty/clean pair so spatial correspondence is preserved.
-    """
-    k    = int(rng.integers(0, 4))
-    flip = bool(rng.integers(0, 2))
-    dirty = np.rot90(dirty, k=k)
-    clean = np.rot90(clean, k=k)
-    if flip:
-        dirty = np.fliplr(dirty)
-        clean = np.fliplr(clean)
-    return np.ascontiguousarray(dirty), np.ascontiguousarray(clean)
-
-
-def _augment_single(
-    img: np.ndarray,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Apply a random D4 transform (4 rotations × optional flip) to a single image."""
-    k    = int(rng.integers(0, 4))
-    flip = bool(rng.integers(0, 2))
-    img  = np.rot90(img, k=k)
-    if flip:
-        img = np.fliplr(img)
-    return np.ascontiguousarray(img)
-
 
 class FlowTrainer:
     """
@@ -374,62 +345,53 @@ class FlowTrainer:
 
     Algorithm (per minibatch)
     -------------------------
-    1. x0 = dirty image,  x1 = clean image  (naturally paired — no OT needed)
+    1. x0 = dirty image,  x1 = clean image  (generated on-the-fly by GPUSimulator)
     2. Draw t ~ U[0,1]  (B,)
     3. Interpolate: x_t = (1 − t) · x0 + t · x1
     4. Target velocity: u = x1 − x0  (straight path from dirty to clean)
-    5. CFM loss: ‖v_θ(x_t, t) − u‖²
+    5. Heteroscedastic NLL loss (Kendall & Gal 2017)
     6. Adam step
 
-    Normalisation: expects pre-normalised inputs (PSF-area normalisation applied
-    by SimulateObservations). No additional normalisation is applied here.
+    Normalisation: none. Dirty is in Jy/beam, clean in Jy/pixel (physical units).
+    This is required for SBI validity — see PLAN.md.
 
     Parameters
     ----------
-    n_epochs   : int    (default 100)
-    batch_size : int    (default 8)
-    lr         : float  Adam learning rate (default 1e-4)
-    random_seed: int    (default 42)
+    n_epochs    : int    (default 100)
+    lr          : float  Adam learning rate (default 1e-4)
+    random_seed : int    (default 42)
     """
 
     def __init__(
         self,
         n_epochs   : int   = 100,
-        batch_size : int   = 8,
         lr         : float = 1e-4,
         random_seed: int   = 42,
     ):
         self.n_epochs    = n_epochs
-        self.batch_size  = batch_size
         self.lr          = lr
         self.random_seed = random_seed
 
     def fit(
         self,
-        dirty       : np.ndarray,
-        clean       : np.ndarray,
-        device      : str = "cpu",
+        simulator   : "GPUSimulator",  # noqa: F821
+        device      : str = "cuda",
         resume_from : Optional[str | Path] = None,
         out_path    : Optional[str | Path] = None,
     ) -> FlowModel:
         """
-        Train on paired (N, H, W) dirty and clean float32 images.
+        Train using on-the-fly (dirty, clean) pairs from a GPUSimulator.
 
         Parameters
         ----------
-        dirty       : np.ndarray (N, H, W) float32 — PSF-convolved + noise
-        clean       : np.ndarray (N, H, W) float32 — ground truth sky
+        simulator   : GPUSimulator — holds clean images + PSF on GPU, generates
+                      augmented (dirty, clean) pairs each batch.
         device      : torch device string
         resume_from : path to an existing .pt checkpoint to resume from.
-                      Loads weights into the model before training begins.
-                      n_epochs additional epochs are run on top of the checkpoint.
+                      Loads weights before training; n_epochs additional epochs run.
+        out_path    : if provided, best model saved to out_path.with_suffix('.best.pt')
         """
-        assert dirty.shape == clean.shape, (
-            f"dirty {dirty.shape} and clean {clean.shape} must match"
-        )
         dev = torch.device(device)
-        rng = np.random.default_rng(self.random_seed)
-        N, H, W = clean.shape
 
         if resume_from is not None:
             fm = FlowModel.load(resume_from, device=device)
@@ -441,29 +403,22 @@ class FlowTrainer:
         best_path = Path(out_path).with_suffix(".best.pt") if out_path is not None else None
         best_loss = float("inf")
 
-        print(f"FlowTrainer (dirty→clean): N={N}  {H}×{W}  "
-              f"batch={self.batch_size}  epochs={self.n_epochs}  device={dev}")
+        print(f"FlowTrainer (dirty→clean): N={simulator.N}  {simulator.H}×{simulator.W}  "
+              f"batch={simulator.batch_size}  epochs={self.n_epochs}  device={dev}")
         if best_path is not None:
             print(f"  Best checkpoint → {best_path}")
 
+        torch.manual_seed(self.random_seed)
+
         for epoch in range(self.n_epochs):
-            idx           = rng.permutation(N)
-            epoch_loss    = 0.0
-            epoch_sigma   = 0.0
-            n_batches     = 0
+            epoch_loss  = 0.0
+            epoch_sigma = 0.0
+            n_batches   = 0
 
             fm._net.train()
-            for b_start in range(0, N, self.batch_size):
-                batch_idx = idx[b_start : b_start + self.batch_size]
-
-                # 8-fold augmentation applied identically to dirty/clean pair
-                pairs    = [_augment_pair(dirty[i], clean[i], rng) for i in batch_idx]
-                dirty_np = np.stack([p[0] for p in pairs])   # (B, H, W)
-                clean_np = np.stack([p[1] for p in pairs])   # (B, H, W)
-
-                x0 = torch.from_numpy(dirty_np[:, None]).float().to(dev)  # (B,1,H,W)
-                x1 = torch.from_numpy(clean_np[:, None]).float().to(dev)  # (B,1,H,W)
-                B  = x0.shape[0]
+            for clean_batch in simulator.generate_epoch(shuffle=True):
+                x0, x1 = simulator.forward(clean_batch)  # (B,1,H,W) dirty, clean — on GPU
+                B = x0.shape[0]
 
                 t  = torch.rand(B, device=dev)
                 t4 = t[:, None, None, None]
@@ -476,8 +431,6 @@ class FlowTrainer:
                 log_var = log_var.clamp(-10, 10)
                 # Heteroscedastic NLL (Kendall & Gal 2017):
                 #   L = 0.5 * [ (v - u)² / exp(log_var) + log_var ]
-                # exp(log_var) penalises overconfidence; log_var penalises underconfidence.
-                # Optimal: log_var ≈ log((v_pred - u_target)²).
                 loss = 0.5 * (
                     (v_pred - u_target) ** 2 / log_var.exp() + log_var
                 ).mean()
@@ -503,8 +456,7 @@ class FlowTrainer:
         return fm
 
     def __repr__(self) -> str:
-        return (f"FlowTrainer(n_epochs={self.n_epochs}, "
-                f"batch_size={self.batch_size}, lr={self.lr})")
+        return (f"FlowTrainer(n_epochs={self.n_epochs}, lr={self.lr})")
 
 
 # ---------------------------------------------------------------------------
@@ -516,14 +468,14 @@ class PriorTrainer:
     Train a FlowModel as an unconditional prior p(clean) using CFM.
 
     Unlike FlowTrainer (which maps dirty→clean), PriorTrainer maps noise→clean.
-    The resulting model encodes source morphology without any PSF structure —
-    it is fully instrument-agnostic and can be coupled to any PSF at inference
-    via the likelihood gradient (see DPSSolver in solvers.py).
+    The resulting model encodes source morphology and flux without PSF structure —
+    it is instrument-agnostic and is coupled to a specific PSF at inference via
+    the likelihood gradient (see DPSSolver in solvers.py).
 
     Algorithm (per minibatch)
     -------------------------
     1. x0 = N(0, 1)  — pure Gaussian noise (no dirty image)
-       x1 = clean image
+       x1 = clean image (raw Jy/pixel, no normalisation)
     2. Draw t ~ U[0, 1]  (B,)
     3. Interpolate: x_t = (1 − t) · x0 + t · x1
     4. Target velocity: u = x1 − x0  (straight path from noise to clean)
@@ -533,46 +485,42 @@ class PriorTrainer:
 
     Parameters
     ----------
-    n_epochs   : int    (default 500)
-    batch_size : int    (default 16)
-    lr         : float  Adam learning rate (default 1e-4)
-    random_seed: int    (default 42)
+    n_epochs    : int    (default 500)
+    lr          : float  Adam learning rate (default 1e-4)
+    random_seed : int    (default 42)
     """
 
     def __init__(
         self,
         n_epochs   : int   = 500,
-        batch_size : int   = 16,
         lr         : float = 1e-4,
         random_seed: int   = 42,
     ):
         self.n_epochs    = n_epochs
-        self.batch_size  = batch_size
         self.lr          = lr
         self.random_seed = random_seed
 
     def fit(
         self,
-        clean       : np.ndarray,
-        device      : str = "cpu",
+        simulator   : "GPUSimulator",  # noqa: F821
+        device      : str = "cuda",
         resume_from : Optional[str | Path] = None,
         out_path    : Optional[str | Path] = None,
     ) -> FlowModel:
         """
-        Train on (N, H, W) clean float32 images — no dirty images needed.
+        Train unconditional prior on clean images from a GPUSimulator.
+
+        Only the clean images are used — dirty is not generated here.
+        D4 augmentation from GPUSimulator.forward is used for clean variety.
 
         Parameters
         ----------
-        clean       : np.ndarray (N, H, W) float32 — ground truth sky images
+        simulator   : GPUSimulator — clean images on GPU, D4 augmentation applied
         device      : torch device string
-        resume_from : path to an existing .pt checkpoint to resume from.
-                      Loads weights before training; n_epochs additional epochs run.
-        out_path    : if provided, best model (lowest loss) is saved to
-                      out_path.with_suffix('.best.pt') after every improvement.
+        resume_from : path to an existing .pt checkpoint to resume from
+        out_path    : if provided, best model saved to out_path.with_suffix('.best.pt')
         """
         dev = torch.device(device)
-        rng = np.random.default_rng(self.random_seed)
-        N, H, W = clean.shape
 
         if resume_from is not None:
             fm = FlowModel.load(resume_from, device=device)
@@ -584,26 +532,23 @@ class PriorTrainer:
         best_path = Path(out_path).with_suffix(".best.pt") if out_path is not None else None
         best_loss = float("inf")
 
-        print(f"PriorTrainer (noise→clean): N={N}  {H}×{W}  "
-              f"batch={self.batch_size}  epochs={self.n_epochs}  device={dev}")
+        print(f"PriorTrainer (noise→clean): N={simulator.N}  {simulator.H}×{simulator.W}  "
+              f"batch={simulator.batch_size}  epochs={self.n_epochs}  device={dev}")
         if best_path is not None:
             print(f"  Best checkpoint → {best_path}")
 
+        torch.manual_seed(self.random_seed)
+
         for epoch in range(self.n_epochs):
-            idx           = rng.permutation(N)
-            epoch_loss    = 0.0
-            epoch_sigma   = 0.0
-            n_batches     = 0
+            epoch_loss  = 0.0
+            epoch_sigma = 0.0
+            n_batches   = 0
 
             fm._net.train()
-            for b_start in range(0, N, self.batch_size):
-                batch_idx = idx[b_start : b_start + self.batch_size]
-
-                clean_aug = [_augment_single(clean[i], rng) for i in batch_idx]
-                clean_np  = np.stack(clean_aug)   # (B, H, W)
-
-                x1 = torch.from_numpy(clean_np[:, None]).float().to(dev)  # (B,1,H,W)
-                x0 = torch.randn_like(x1)                                   # pure noise
+            for clean_batch in simulator.generate_epoch(shuffle=True):
+                # Only need augmented clean — discard dirty
+                _, x1 = simulator.forward(clean_batch)   # (B, 1, H, W) on GPU
+                x0 = torch.randn_like(x1)
                 B  = x1.shape[0]
 
                 t  = torch.rand(B, device=dev)
@@ -640,5 +585,4 @@ class PriorTrainer:
         return fm
 
     def __repr__(self) -> str:
-        return (f"PriorTrainer(n_epochs={self.n_epochs}, "
-                f"batch_size={self.batch_size}, lr={self.lr})")
+        return (f"PriorTrainer(n_epochs={self.n_epochs}, lr={self.lr})")

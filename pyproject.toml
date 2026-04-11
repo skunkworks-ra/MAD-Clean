@@ -33,11 +33,13 @@ pytest       = ">=8.0"
 matplotlib   = ">=3.8"
 
 [tool.pixi.feature.cpu.dependencies]
-pytorch  = {version = ">=2.2", channel = "pytorch"}
-cpuonly  = {channel = "pytorch"}
+pytorch     = {version = ">=2.2", channel = "pytorch"}
+torchvision = {version = ">=0.17", channel = "pytorch"}
+cpuonly     = {channel = "pytorch"}
 
 [tool.pixi.feature.gpu.dependencies]
 pytorch      = {version = ">=2.2",  channel = "pytorch"}
+torchvision  = {version = ">=0.17", channel = "pytorch"}
 pytorch-cuda = {version = ">=12.1", channel = "pytorch"}
 
 [tool.pixi.environments]
