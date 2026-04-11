@@ -118,70 +118,19 @@ class GPUSimulator:
         # --- padding size for linear FFT convolution ---
         self._pad = _next_pow2(2 * max(self.H, self.W))
 
-        # --- derive batch size from VRAM budget ---
-        # Fixed costs (model params + optimizer moments + CUDA context):
-        #   UNetVelocityField ~2.5M params × 4 bytes = 10 MB
-        #   Adam moment tensors × 2 = 20 MB
-        #   CUDA context + PyTorch allocator overhead ≈ 300 MB
-        fixed_overhead_bytes = int(0.35 * 1024 ** 3)
+        # batch_size is derived from vram_budget_gb: budget / dataset size,
+        # capped at N. Tune vram_budget_gb down if OOM during training.
+        dataset_bytes   = self._clean.element_size() * self._clean.numel()
+        budget_bytes    = int(vram_budget_gb * 1024 ** 3)
+        self.batch_size = max(1, min(self.N, budget_bytes // dataset_bytes * self.N // 4))
 
-        dataset_bytes = self._clean.element_size() * self._clean.numel()
-
-        # Per-sample peak memory during a training step:
-        #   FFT workspace: padded clean + 2× complex rfft2 + padded dirty
-        fft_bytes = (
-            self._pad ** 2 * 4                         # padded clean (real)
-            + 2 * self._pad * (self._pad // 2 + 1) * 8  # clean_fft + dirty_fft (complex)
-            + self._pad ** 2 * 4                       # dirty_pad (real)
-        )
-        #   UNet activations stored for backprop (enc1/2, bot, dec1/2 feature maps):
-        #     enc1: 32×H×W, enc2: 64×H/2×W/2, bot: 128×H/4×W/4 ×2, dec2: 64×H/2×W/2, dec1: 32×H×W
-        unet_act_bytes = 4 * (
-            32 * self.H * self.W            # enc1
-            + 64 * (self.H // 2) * (self.W // 2)   # enc2
-            + 2 * 128 * (self.H // 4) * (self.W // 4)  # bot1 + bot2
-            + 64 * (self.H // 2) * (self.W // 2)   # dec2
-            + 32 * self.H * self.W          # dec1
-        )
-        #   Gradients mirror activations; also x_t, u_target, v_pred, log_var
-        grad_bytes     = unet_act_bytes + 4 * self.H * self.W * 4
-
-        bytes_per_sample = fft_bytes + unet_act_bytes + grad_bytes
-
-        budget_bytes     = int(vram_budget_gb * 1024 ** 3)
-        available        = budget_bytes - dataset_bytes - fixed_overhead_bytes
-        estimated        = max(1, available // bytes_per_sample)
-        self.batch_size  = self._autotune_batch_size(estimated)
         print(
             f"GPUSimulator: N={self.N}  {self.H}×{self.W}  "
             f"pad={self._pad}  noise_std={noise_std}  device={self.device}\n"
             f"  dataset={dataset_bytes/1024**2:.1f} MB  "
             f"batch_size={self.batch_size} "
-            f"(from {vram_budget_gb} GB budget)"
+            f"(vram_budget_gb={vram_budget_gb} — reduce if OOM)"
         )
-
-    def _autotune_batch_size(self, estimated: int) -> int:
-        """
-        Validate the estimated batch size with a real forward pass.
-        Halves on OOM until it fits or reaches 1.
-        """
-        if self.device.type == "cpu":
-            return estimated
-
-        batch_size = estimated
-        while batch_size >= 1:
-            try:
-                probe = self._clean[:batch_size]
-                self.forward(probe)
-                torch.cuda.empty_cache()
-                print(f"  batch_size={batch_size} validated by dry run")
-                return batch_size
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                batch_size = max(1, batch_size // 2)
-                print(f"  OOM — reducing batch_size to {batch_size}")
-
-        return 1
 
     # ------------------------------------------------------------------
     def forward(

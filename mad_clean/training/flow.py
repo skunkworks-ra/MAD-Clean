@@ -417,20 +417,15 @@ class FlowTrainer:
 
             fm._net.train()
             for clean_batch in simulator.generate_epoch(shuffle=True):
-                x0, x1 = simulator.forward(clean_batch)  # (B,1,H,W) dirty, clean — on GPU
-                B = x0.shape[0]
-
+                x0, x1 = simulator.forward(clean_batch)
+                B  = x0.shape[0]
                 t  = torch.rand(B, device=dev)
                 t4 = t[:, None, None, None]
-
-                x_t      = (1.0 - t4) * x0 + t4 * x1   # dirty → clean interpolant
-                u_target = x1 - x0                       # velocity: dirty → clean
-
+                x_t      = (1.0 - t4) * x0 + t4 * x1
+                u_target = x1 - x0
                 optimizer.zero_grad()
                 v_pred, log_var = fm._net(x_t, t)
                 log_var = log_var.clamp(-10, 10)
-                # Heteroscedastic NLL (Kendall & Gal 2017):
-                #   L = 0.5 * [ (v - u)² / exp(log_var) + log_var ]
                 loss = 0.5 * (
                     (v_pred - u_target) ** 2 / log_var.exp() + log_var
                 ).mean()
