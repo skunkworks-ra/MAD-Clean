@@ -148,9 +148,10 @@ class GPUSimulator:
 
         bytes_per_sample = fft_bytes + unet_act_bytes + grad_bytes
 
-        budget_bytes    = int(vram_budget_gb * 1024 ** 3)
-        available       = budget_bytes - dataset_bytes - fixed_overhead_bytes
-        self.batch_size = max(1, available // bytes_per_sample)
+        budget_bytes     = int(vram_budget_gb * 1024 ** 3)
+        available        = budget_bytes - dataset_bytes - fixed_overhead_bytes
+        estimated        = max(1, available // bytes_per_sample)
+        self.batch_size  = self._autotune_batch_size(estimated)
         print(
             f"GPUSimulator: N={self.N}  {self.H}×{self.W}  "
             f"pad={self._pad}  noise_std={noise_std}  device={self.device}\n"
@@ -158,6 +159,29 @@ class GPUSimulator:
             f"batch_size={self.batch_size} "
             f"(from {vram_budget_gb} GB budget)"
         )
+
+    def _autotune_batch_size(self, estimated: int) -> int:
+        """
+        Validate the estimated batch size with a real forward pass.
+        Halves on OOM until it fits or reaches 1.
+        """
+        if self.device.type == "cpu":
+            return estimated
+
+        batch_size = estimated
+        while batch_size >= 1:
+            try:
+                probe = self._clean[:batch_size]
+                self.forward(probe)
+                torch.cuda.empty_cache()
+                print(f"  batch_size={batch_size} validated by dry run")
+                return batch_size
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                batch_size = max(1, batch_size // 2)
+                print(f"  OOM — reducing batch_size to {batch_size}")
+
+        return 1
 
     # ------------------------------------------------------------------
     def forward(
