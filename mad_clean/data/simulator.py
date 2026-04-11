@@ -119,20 +119,38 @@ class GPUSimulator:
         self._pad = _next_pow2(2 * max(self.H, self.W))
 
         # --- derive batch size from VRAM budget ---
-        # Dataset footprint (bytes already on GPU):
+        # Fixed costs (model params + optimizer moments + CUDA context):
+        #   UNetVelocityField ~2.5M params × 4 bytes = 10 MB
+        #   Adam moment tensors × 2 = 20 MB
+        #   CUDA context + PyTorch allocator overhead ≈ 300 MB
+        fixed_overhead_bytes = int(0.35 * 1024 ** 3)
+
         dataset_bytes = self._clean.element_size() * self._clean.numel()
-        # Per-sample workspace during forward (complex FFT intermediate dominates):
-        #   padded real: pad² × 4
-        #   padded complex rfft2: pad × (pad//2+1) × 8
-        #   dirty output: H × W × 4
-        bytes_per_sample = (
-            self._pad ** 2 * 4          # padded clean
-            + self._pad * (self._pad // 2 + 1) * 8   # complex FFT
-            + self.H * self.W * 4       # dirty output
+
+        # Per-sample peak memory during a training step:
+        #   FFT workspace: padded clean + 2× complex rfft2 + padded dirty
+        fft_bytes = (
+            self._pad ** 2 * 4                         # padded clean (real)
+            + 2 * self._pad * (self._pad // 2 + 1) * 8  # clean_fft + dirty_fft (complex)
+            + self._pad ** 2 * 4                       # dirty_pad (real)
         )
-        budget_bytes     = int(vram_budget_gb * 1024 ** 3)
-        available        = budget_bytes - dataset_bytes
-        self.batch_size  = max(1, available // bytes_per_sample)
+        #   UNet activations stored for backprop (enc1/2, bot, dec1/2 feature maps):
+        #     enc1: 32×H×W, enc2: 64×H/2×W/2, bot: 128×H/4×W/4 ×2, dec2: 64×H/2×W/2, dec1: 32×H×W
+        unet_act_bytes = 4 * (
+            32 * self.H * self.W            # enc1
+            + 64 * (self.H // 2) * (self.W // 2)   # enc2
+            + 2 * 128 * (self.H // 4) * (self.W // 4)  # bot1 + bot2
+            + 64 * (self.H // 2) * (self.W // 2)   # dec2
+            + 32 * self.H * self.W          # dec1
+        )
+        #   Gradients mirror activations; also x_t, u_target, v_pred, log_var
+        grad_bytes     = unet_act_bytes + 4 * self.H * self.W * 4
+
+        bytes_per_sample = fft_bytes + unet_act_bytes + grad_bytes
+
+        budget_bytes    = int(vram_budget_gb * 1024 ** 3)
+        available       = budget_bytes - dataset_bytes - fixed_overhead_bytes
+        self.batch_size = max(1, available // bytes_per_sample)
         print(
             f"GPUSimulator: N={self.N}  {self.H}×{self.W}  "
             f"pad={self._pad}  noise_std={noise_std}  device={self.device}\n"
