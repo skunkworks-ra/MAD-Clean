@@ -319,10 +319,19 @@ class PSFFlowTrainer:
             shuffle     = True,
             num_workers = num_workers,
             pin_memory  = (device == "cuda"),
+            persistent_workers = (num_workers > 0),
         )
 
+        # Multi-GPU via DataParallel if available
+        n_gpus = torch.cuda.device_count() if device == "cuda" else 0
+        net    = model._net
+        if n_gpus > 1:
+            net = torch.nn.DataParallel(model._net)
+            print(f"Using {n_gpus} GPUs via DataParallel")
+
         print(f"PSFFlowTrainer: {len(dataset):,} training pairs  "
-              f"batch={self.batch_size}  epochs={self.n_epochs}  device={device}")
+              f"batch={self.batch_size}  epochs={self.n_epochs}  "
+              f"workers={num_workers}  device={device}")
 
         opt       = torch.optim.Adam(model._net.parameters(), lr=self.lr)
         best_loss = float("inf")
@@ -344,7 +353,7 @@ class PSFFlowTrainer:
 
                 x_in = torch.stack([xt, p], dim=1)        # (B, 2, H, W)
 
-                v, log_var = model._net(x_in, t)
+                v, log_var = net(x_in, t)
                 v       = v.squeeze(1)
                 log_var = log_var.squeeze(1).clamp(-10, 10)
                 loss    = (0.5 * (u - v) ** 2 * torch.exp(-log_var)

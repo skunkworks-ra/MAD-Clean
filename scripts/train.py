@@ -80,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[C] Adam learning rate for FlowTrainer")
     p.add_argument("--resume", default=None,
                    help="[C/P/V] Path to existing .pt checkpoint to resume from")
+    p.add_argument("--num_workers", type=int, default=4,
+                   help="[PSF] DataLoader worker processes")
 
     p.add_argument("--latent_dim", type=int,   default=128,
                    help="[V] VAE latent dimension")
@@ -223,6 +225,7 @@ def main() -> None:
             device      = args.device,
             resume_from = args.resume,
             out_path    = out_path,
+            num_workers = args.num_workers,
         )
         fm.save(out_path)
 
