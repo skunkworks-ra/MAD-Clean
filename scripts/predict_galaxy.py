@@ -36,15 +36,14 @@ dirty  += np.random.default_rng(42).standard_normal(dirty.shape).astype(np.float
 
 print(f"Dirty:       range=[{dirty.min():.3f}, {dirty.max():.3f}]  noise_std={noise_std}")
 
-np.savez(
-    "crumb_data/dirty_galaxy.npz",
-    clean        = clean,
-    dirty        = dirty,
-    psf          = psf,
-    psf_beam_area= np.float32(psf.sum()),
-    noise_std    = np.float32(noise_std),
-    source_idx   = np.int32(252),
-)
+torch.save({
+    "clean"        : torch.from_numpy(clean),
+    "dirty"        : torch.from_numpy(dirty),
+    "psf"          : torch.from_numpy(psf),
+    "psf_beam_area": torch.tensor(psf.sum()),
+    "noise_std"    : torch.tensor(noise_std),
+    "source_idx"   : torch.tensor(252),
+}, "crumb_data/dirty_galaxy.pt")
 print("Saved → crumb_data/dirty_galaxy.npz\n")
 
 # ── 3. Run every solver ────────────────────────────────────────────────────────

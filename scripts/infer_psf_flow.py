@@ -22,7 +22,7 @@ from mad_clean.training.psf_flow import PSFFlowModel
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model",    default="models/psf_flow_model.pt")
-    p.add_argument("--galaxy",   default="crumb_data/dirty_galaxy.npz")
+    p.add_argument("--galaxy",   default="crumb_data/dirty_galaxy.pt")
     p.add_argument("--n_steps",  type=int, default=32)
     p.add_argument("--device",   default="cuda")
     p.add_argument("--out",      default="logs/infer_psf_flow.png")
@@ -34,10 +34,10 @@ def main():
     model = PSFFlowModel.load(args.model, device=device)
 
     # Load galaxy
-    data  = np.load(args.galaxy)
-    dirty = torch.from_numpy(data["dirty"]).float()
-    clean = torch.from_numpy(data["clean"]).float()
-    psf   = torch.from_numpy(data["psf"]).float()
+    data  = torch.load(args.galaxy, map_location="cpu", weights_only=True)
+    dirty = data["dirty"].float()
+    clean = data["clean"].float()
+    psf   = data["psf"].float()
 
     print(f"dirty: [{dirty.min():.3f}, {dirty.max():.3f}]")
     print(f"clean: [{clean.min():.3f}, {clean.max():.3f}]")
