@@ -18,6 +18,10 @@ Variant P  (unconditional prior — clean images only):
     mad-train --variant P --data crumb_data/flow_pairs_vla.npz \\
         --out models/prior_model.pt [--n_epochs 500] [--batch_size 16] [--device cuda]
 
+Variant V  (VAE — clean images only, Phase 2):
+    mad-train --variant V --data crumb_data/flow_pairs_vla.npz \\
+        --out models/vae_d128.pt [--latent_dim 128] [--beta 1.0] [--device cuda]
+
 The --data file must be a .npz produced by scripts/simulate.py, with keys:
     clean     (N, H, W) float32
     dirty     (N, H, W) float32
@@ -33,7 +37,8 @@ import numpy as np
 from mad_clean.training import (
     PatchDictTrainer, ConvDictTrainer,
     FlowTrainer, PriorTrainer,
-    AmortisedPosteriorTrainer,
+    VAETrainer, LatentPriorTrainer,
+    PSFFlowTrainer,
 )
 
 
@@ -42,9 +47,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Train a MAD-CLEAN filter bank or flow model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--variant",    required=True, choices=["A", "B", "C", "P", "Q"],
+    p.add_argument("--variant",    required=True, choices=["A", "B", "C", "P", "V", "Q", "PSF"],
                    help="A=patch OMP, B=CDL PSF-residual, C=flow matching, "
-                        "P=unconditional prior, Q=amortised posterior (Phase 2)")
+                        "P=unconditional prior, V=VAE (Phase 2), "
+                        "Q=latent flow prior (Phase 2)")
     p.add_argument("--data",       required=True,
                    help="Path to .npz with clean/dirty/psf keys")
     p.add_argument("--out",        required=True,
@@ -73,10 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr",     type=float, default=1e-4,
                    help="[C] Adam learning rate for FlowTrainer")
     p.add_argument("--resume", default=None,
-                   help="[C/P/Q] Path to existing .pt checkpoint to resume from")
-    p.add_argument("--dps_samples", default="crumb_data/dps_samples.npz",
-                   help="[Q] Path to DPS posterior samples .npz "
-                        "(from scripts/collect_dps_samples.py)")
+                   help="[C/P/V] Path to existing .pt checkpoint to resume from")
+
+    p.add_argument("--latent_dim", type=int,   default=128,
+                   help="[V] VAE latent dimension")
+    p.add_argument("--beta",       type=float, default=1.0,
+                   help="[V] KL weight in VAE loss")
 
     return p
 
@@ -91,19 +99,20 @@ def main() -> None:
 
     data = np.load(data_path)
 
-    if "clean" in data:
-        clean = data["clean"].astype(np.float32)
-        dirty = data["dirty"].astype(np.float32) if "dirty" in data else None
-    elif "images" in data:
-        clean = data["images"].astype(np.float32)
-        dirty = None
-    else:
-        print("ERROR: npz must contain 'clean' or 'images' key", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Loaded {len(clean)} images  shape={clean.shape[1]}×{clean.shape[2]}")
-    if dirty is not None:
-        print(f"  dirty images available  shape={dirty.shape[1]}×{dirty.shape[2]}")
+    # Variant Q uses z_codes directly — skip image loading
+    clean = dirty = None
+    if args.variant != "Q":
+        if "clean" in data:
+            clean = data["clean"].astype(np.float32)
+            dirty = data["dirty"].astype(np.float32) if "dirty" in data else None
+        elif "images" in data:
+            clean = data["images"].astype(np.float32)
+        else:
+            print("ERROR: npz must contain 'clean' or 'images' key", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loaded {len(clean)} images  shape={clean.shape[1]}×{clean.shape[2]}")
+        if dirty is not None:
+            print(f"  dirty images available  shape={dirty.shape[1]}×{dirty.shape[2]}")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,7 +163,8 @@ def main() -> None:
             batch_size = args.batch_size,
             lr         = args.lr,
         )
-        fm = trainer.fit(dirty, clean, device=args.device, resume_from=args.resume)
+        fm = trainer.fit(dirty, clean, device=args.device, resume_from=args.resume,
+                         out_path=out_path)
         fm.save(out_path)
 
     elif args.variant == "P":
@@ -163,21 +173,59 @@ def main() -> None:
             batch_size = args.batch_size,
             lr         = args.lr,
         )
-        fm = trainer.fit(clean, device=args.device, resume_from=args.resume)
+        fm = trainer.fit(clean, device=args.device, resume_from=args.resume,
+                         out_path=out_path)
         fm.save(out_path)
 
-    else:  # Q — amortised posterior
-        trainer = AmortisedPosteriorTrainer(
+    elif args.variant == "V":
+        trainer = VAETrainer(
+            n_epochs   = args.n_epochs,
+            batch_size = args.batch_size,
+            lr         = args.lr,
+            beta       = args.beta,
+            latent_dim = args.latent_dim,
+        )
+        vae = trainer.fit(clean, device=args.device, resume_from=args.resume)
+        vae.save(out_path)
+
+    elif args.variant == "Q":
+        if "z_codes" not in data:
+            print("ERROR: --variant Q requires a 'z_codes' key. "
+                  "Run scripts/collect_z_codes.py first.", file=sys.stderr)
+            sys.exit(1)
+        z_codes = data["z_codes"].astype(np.float32)
+        print(f"Loaded z_codes ({z_codes.shape[0]}, {z_codes.shape[1]})")
+        trainer = LatentPriorTrainer(
             n_epochs   = args.n_epochs,
             batch_size = args.batch_size,
             lr         = args.lr,
         )
-        cfm = trainer.fit(
-            args.dps_samples,
+        lf = trainer.fit(z_codes, device=args.device, resume_from=args.resume,
+                         out_path=out_path)
+        lf.save(out_path)
+
+    elif args.variant == "PSF":
+        if "psf" not in data or "train_mask" not in data:
+            print("ERROR: --variant PSF requires psf_pairs.npz from scripts/generate_psf_data.py",
+                  file=sys.stderr)
+            sys.exit(1)
+        psf_arr    = data["psf"].astype(np.float32)
+        train_mask = data["train_mask"]
+        trainer = PSFFlowTrainer(
+            n_epochs   = args.n_epochs,
+            batch_size = args.batch_size,
+            lr         = args.lr,
+        )
+        fm = trainer.fit(
+            dirty       = dirty,
+            psf         = psf_arr,
+            clean       = clean,
+            train_mask  = train_mask,
             device      = args.device,
             resume_from = args.resume,
+            out_path    = out_path,
         )
-        cfm.save(out_path)
+        fm.save(out_path)
 
     print(f"Done → {out_path}")
 

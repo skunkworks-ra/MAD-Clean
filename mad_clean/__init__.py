@@ -30,11 +30,10 @@ Quick start
 
 from .filters     import FilterBank
 from .detection   import IslandDetector
-from .solvers     import PatchSolver, ConvSolver, FlowSolver
-from .deconvolver import MADClean
+from .solvers     import PatchSolver, ConvSolver, FlowSolver, DPSSolver, LatentDPSSolver
+from .deconvolver import BaseDeconvolver, HogbomDeconvolver, MADCleanDeconvolver
 from .io          import load_image, load_image_data, save_fits
 from .training    import FlowModel, FlowTrainer, PatchDictTrainer, ConvDictTrainer
-from .hogbom      import hogbom_clean
 from .psf_utils   import compute_psf_patch
 from .normalise   import ImageNormaliser
 
@@ -44,7 +43,11 @@ __all__ = [
     "PatchSolver",
     "ConvSolver",
     "FlowSolver",
-    "MADClean",
+    "DPSSolver",
+    "LatentDPSSolver",
+    "BaseDeconvolver",
+    "HogbomDeconvolver",
+    "MADCleanDeconvolver",
     "load_image",
     "load_image_data",
     "save_fits",
@@ -53,7 +56,6 @@ __all__ = [
     "PatchDictTrainer",
     "ConvDictTrainer",
     "compute_psf_patch",
-    "hogbom_clean",
     "ImageNormaliser",
 ]
 

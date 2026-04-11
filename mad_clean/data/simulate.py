@@ -150,10 +150,11 @@ class SimulateObservations:
         N, H, W = clean.shape
         print(f"Loaded {N} clean images  shape={H}×{W}")
 
-        # Per-image normalisation of clean (zero mean, unit std).
-        img_mean = clean.mean(axis=(1, 2), keepdims=True)
-        img_std  = clean.std(axis=(1, 2),  keepdims=True) + 1e-8
-        clean_n  = (clean - img_mean) / img_std
+        # Per-image peak normalisation: map each image to [0, 1].
+        # Both clean and dirty are divided by the same peak so the
+        # flux relationship between them is preserved for training.
+        peak    = clean.max(axis=(1, 2), keepdims=True) + 1e-8
+        clean_n = clean / peak
 
         if self.psf_fwhm is not None:
             psf = _make_gaussian_psf(self.psf_fwhm, size=max(H, W))
@@ -163,27 +164,23 @@ class SimulateObservations:
             psf = _load_psf(self.psf_path, target_shape=(H, W))
             print(f"Loaded PSF from {self.psf_path}  shape={psf.shape}")
 
-        # Dirty = PSF ⊛ clean_n + noise (in PSF-convolved flux units).
-        dirty = _convolve_psf(clean_n, psf)
-        rng   = np.random.default_rng(self.seed)
-        dirty += rng.standard_normal(dirty.shape).astype(np.float32) * self.noise_std
-
-        # Area normalisation: divide by PSF total flux so dirty ≈ clean in scale.
+        # PSF conventions (CASA standard):
+        #   psf      — peak=1 → dirty in Jy/beam, model in Jy/pixel
+        #   psf_norm — sum=1  → stored for reference only
+        # For a point source: dirty.peak = clean.peak × psf.peak = clean.peak.
         normaliser = ImageNormaliser().fit(psf)
-        dirty_n    = normaliser.transform(dirty)
+        psf_norm   = (psf / normaliser.area).astype(np.float32)
 
-        print(f"PSF area (sum): {normaliser.area:.2f}")
-        print(f"Dirty (raw)   std={dirty.std():.3f}  "
-              f"range=[{dirty.min():.3f}, {dirty.max():.3f}]")
-        print(f"Dirty (norm)  std={dirty_n.std():.3f}  "
+        dirty   = _convolve_psf(clean_n, psf)   # peak=1 PSF → Jy/beam
+        rng     = np.random.default_rng(self.seed)
+        dirty  += rng.standard_normal(dirty.shape).astype(np.float32) * self.noise_std
+        dirty_n = dirty
+
+        print(f"PSF peak={psf.max():.4f}  area={normaliser.area:.2f}")
+        print(f"Dirty  std={dirty_n.std():.3f}  "
               f"range=[{dirty_n.min():.3f}, {dirty_n.max():.3f}]")
-        print(f"Clean (norm)  std={clean_n.std():.3f}  "
+        print(f"Clean  std={clean_n.std():.3f}  "
               f"range=[{clean_n.min():.3f}, {clean_n.max():.3f}]")
-
-        # psf_norm = psf / psf_area — the PSF paired with dirty_n for CDL training.
-        # ConvDictTrainer's FISTA forward model must use psf_norm, not psf, since
-        # dirty_n = dirty / psf_area = (psf_norm ⊛ clean_n) + noise/psf_area.
-        psf_norm = (psf / normaliser.area).astype(np.float32)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(

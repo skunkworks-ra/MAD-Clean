@@ -7,15 +7,13 @@
 #        --psf <casa.psf> --out models/psf.npz
 #
 # Usage:
-#   bash train_all.sh [cuda|cpu]
-#
-# Resume Variant C only (continues from existing flow_model.pt):
-#   bash train_all.sh cuda resume_c [extra_epochs]
-#   e.g.  bash train_all.sh cuda resume_c 200
+#   bash train_all.sh [cuda|cpu]              — full pipeline: simulate + A + B + C
+#   bash train_all.sh cuda bc                 — simulate + B + C only (skip A)
+#   bash train_all.sh cuda resume_c [epochs]  — resume Variant C from checkpoint
 #
 # Arguments:
 #   $1  device        cuda (default) or cpu
-#   $2  resume_c      if set, resume Variant C from existing checkpoint
+#   $2  mode          bc=simulate+B+C  resume_c=resume C  (default: full pipeline)
 #   $3  extra_epochs  [resume_c only] additional epochs to train (default 200)
 #
 # Outputs:
@@ -28,7 +26,7 @@
 set -euo pipefail
 
 DEVICE="${1:-cuda}"
-MODE="${2:-}"
+MODE="${2:-full}"
 
 PSF_NPZ="models/psf.npz"
 DATA="crumb_data/flow_pairs_vla.npz"
@@ -77,6 +75,72 @@ if [[ "$MODE" == "resume_c" ]]; then
     echo "============================================================"
     echo " Resume complete: $(date)"
     echo " Model: $(ls -lh $CHECKPOINT)"
+    echo "============================================================"
+    exit 0
+fi
+# ── Simulate + Variant B + Variant C only ────────────────────────────────────
+if [[ "$MODE" == "bc" ]]; then
+    if [[ ! -f "crumb_data/crumb_preprocessed.npz" ]]; then
+        echo "ERROR: crumb_data/crumb_preprocessed.npz not found. Run 'pixi run fetch' first." >&2
+        exit 1
+    fi
+    if [[ ! -f "$PSF_NPZ" ]]; then
+        echo "ERROR: $PSF_NPZ not found." >&2
+        echo "  Extract it first with:  python scripts/extract_psf.py --psf <casa.psf> --out $PSF_NPZ" >&2
+        exit 1
+    fi
+
+    echo "============================================================"
+    echo " MAD-CLEAN  simulate + Variant B + Variant C"
+    echo " Device : $DEVICE  (pixi env: $PIXI_ENV)"
+    echo " Data   : $DATA"
+    echo " Started: $(date)"
+    echo "============================================================"
+
+    echo ""
+    echo ">>> STEP 0  simulate dirty/clean pairs with VLA PSF"
+    pixi run -e "$PIXI_ENV" python -u scripts/simulate.py \
+        --data      crumb_data/crumb_preprocessed.npz \
+        --psf       "$PSF_NPZ" \
+        --noise_std 0.05 \
+        --out       "$DATA" \
+        2>&1 | tee "$LOGS/simulate.log"
+    echo ">>> Simulation complete — $DATA"
+
+    echo ""
+    echo ">>> VARIANT B  (CDL FISTA — PSF-residual loss)"
+    pixi run -e "$PIXI_ENV" python -u scripts/train.py \
+        --variant          B \
+        --data             "$DATA" \
+        --out              "$MODELS/cdl_filters_conv" \
+        --device           "$DEVICE" \
+        --k                128 \
+        --atom_size        15 \
+        --lmbda            0.01 \
+        --n_epochs         50 \
+        --lr_d             1e-4 \
+        --batch_size       64 \
+        --fista_iter_train 100 \
+        2>&1 | tee "$LOGS/train_B.log"
+    echo ">>> Variant B complete — $MODELS/cdl_filters_conv"
+
+    echo ""
+    echo ">>> VARIANT C  (conditional flow matching, dirty→clean)"
+    pixi run -e "$PIXI_ENV" python -u scripts/train.py \
+        --variant    C \
+        --data       "$DATA" \
+        --out        "$MODELS/flow_model.pt" \
+        --device     "$DEVICE" \
+        --n_epochs   500 \
+        --batch_size 8 \
+        --lr         1e-4 \
+        2>&1 | tee "$LOGS/train_C.log"
+    echo ">>> Variant C complete — $MODELS/flow_model.pt"
+
+    echo ""
+    echo "============================================================"
+    echo " bc complete: $(date)"
+    ls -lh "$MODELS/"*.npz "$MODELS/"*.pt 2>/dev/null || true
     echo "============================================================"
     exit 0
 fi
@@ -177,6 +241,77 @@ pixi run -e "$PIXI_ENV" python -u scripts/train.py \
     2>&1 | tee "$LOGS/train_C.log"
 
 echo ">>> Variant C complete — $MODELS/flow_model.pt"
+
+# ── Variant P — Unconditional prior (clean images only) ──────────────────────
+echo ""
+echo ">>> VARIANT P  (unconditional prior, noise→clean)"
+echo "    Output : $MODELS/prior_model.pt"
+echo "    Log    : $LOGS/train_P.log"
+
+pixi run -e "$PIXI_ENV" python -u scripts/train.py \
+    --variant    P \
+    --data       "$DATA" \
+    --out        "$MODELS/prior_model.pt" \
+    --device     "$DEVICE" \
+    --n_epochs   500 \
+    --batch_size 16 \
+    --lr         1e-4 \
+    2>&1 | tee "$LOGS/train_P.log"
+
+echo ">>> Variant P complete — $MODELS/prior_model.pt"
+
+# ── Variant V — VAE (clean images only) ──────────────────────────────────────
+echo ""
+echo ">>> VARIANT V  (VAE, clean images only)"
+echo "    Output : $MODELS/vae_d128.pt"
+echo "    Log    : $LOGS/train_V.log"
+
+pixi run -e "$PIXI_ENV" python -u scripts/train.py \
+    --variant    V \
+    --data       "$DATA" \
+    --out        "$MODELS/vae_d128.pt" \
+    --device     "$DEVICE" \
+    --n_epochs   200 \
+    --batch_size 16 \
+    --lr         1e-3 \
+    --latent_dim 128 \
+    --beta       0.0 \
+    2>&1 | tee "$LOGS/train_V.log"
+
+echo ">>> Variant V complete — $MODELS/vae_d128.pt"
+
+# ── Collect z codes ───────────────────────────────────────────────────────────
+echo ""
+echo ">>> COLLECT Z CODES  (VAE encode clean images)"
+echo "    Output : crumb_data/z_codes_d128.npz"
+echo "    Log    : $LOGS/collect_z.log"
+
+pixi run -e "$PIXI_ENV" python -u scripts/collect_z_codes.py \
+    --data   "$DATA" \
+    --vae    "$MODELS/vae_d128.pt" \
+    --out    crumb_data/z_codes_d128.npz \
+    --device "$DEVICE" \
+    2>&1 | tee "$LOGS/collect_z.log"
+
+echo ">>> Z codes collected — crumb_data/z_codes_d128.npz"
+
+# ── Variant Q — Latent flow prior ────────────────────────────────────────────
+echo ""
+echo ">>> VARIANT Q  (latent flow prior on z codes)"
+echo "    Output : $MODELS/latent_prior_d128.pt"
+echo "    Log    : $LOGS/train_Q.log"
+
+pixi run -e "$PIXI_ENV" python -u scripts/train.py \
+    --variant    Q \
+    --data       crumb_data/z_codes_d128.npz \
+    --out        "$MODELS/latent_prior_d128.pt" \
+    --device     "$DEVICE" \
+    --n_epochs   300 \
+    --batch_size 64 \
+    --lr         1e-3 \
+    2>&1 | tee "$LOGS/train_Q.log"
+
+echo ">>> Variant Q complete — $MODELS/latent_prior_d128.pt"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

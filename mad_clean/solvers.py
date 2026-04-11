@@ -28,7 +28,7 @@ from .filters import FilterBank
 from ._utils import soft_threshold
 
 
-__all__ = ["PatchSolver", "ConvSolver", "FlowSolver", "DPSSolver", "AmortisedSolver"]
+__all__ = ["PatchSolver", "ConvSolver", "FlowSolver", "DPSSolver", "LatentDPSSolver"]
 
 
 # ── Variant A — Patch Dictionary Solver ───────────────────────────────────────
@@ -92,22 +92,16 @@ class PatchSolver:
         from sklearn.linear_model import orthogonal_mp
 
         patches_np = patches.cpu().numpy()
-        p_mean = patches_np.mean(axis=1, keepdims=True)
-        p_std  = patches_np.std (axis=1, keepdims=True) + 1e-8
-        patches_n = (patches_np - p_mean) / p_std
 
         Z = orthogonal_mp(
             self._D_cpu,
-            patches_n.T,
+            patches_np.T,
             n_nonzero_coefs=self.n_nonzero,
         )   # (K, n_patches)
 
-        Z_t     = torch.from_numpy(Z.T).float().to(self.device)  # (n_patches, K)
-        D_t     = self.fb.D                                       # (F², K)
-        recon_n = Z_t @ D_t.T
-        p_mean_t = torch.from_numpy(p_mean).float().to(self.device)
-        p_std_t  = torch.from_numpy(p_std ).float().to(self.device)
-        recon_patches = recon_n * p_std_t + p_mean_t   # (n_patches, F²)
+        Z_t           = torch.from_numpy(Z.T).float().to(self.device)  # (n_patches, K)
+        D_t           = self.fb.D                                       # (F², K)
+        recon_patches = Z_t @ D_t.T                                     # (n_patches, F²)
 
         recon_4d = recon_patches.T.unsqueeze(0)
         output_size = (H, W)
@@ -407,7 +401,7 @@ class DPSSolver:
     Parameters
     ----------
     prior_model : FlowModel — trained on clean images via PriorTrainer
-    psf_norm    : np.ndarray (H_p, W_p) — PSF with sum=1 (use data["psf_norm"])
+    psf         : np.ndarray (H_p, W_p) — PSF with peak=1 (CASA convention)
     noise_std   : float — estimated noise level in dirty image (default 0.05)
     n_steps     : int   — Euler ODE steps (default 50)
     n_samples   : int   — independent posterior draws (default 8)
@@ -417,11 +411,12 @@ class DPSSolver:
 
     _CANVAS = 150
     _variant_label = "C/DPS"
+    _needs_peak_norm = False   # DPS receives dirty in original Jy/beam units
 
     def __init__(
         self,
         prior_model : "FlowModel",   # noqa: F821
-        psf_norm    : np.ndarray,
+        psf         : np.ndarray,
         noise_std   : float = 0.05,
         n_steps     : int   = 50,
         n_samples   : int   = 8,
@@ -437,7 +432,7 @@ class DPSSolver:
 
         # Pre-compute PSF FFT at canvas size — done once at init, reused per call.
         C   = self._CANVAS
-        psf = torch.from_numpy(psf_norm).float()
+        psf = torch.from_numpy(psf).float()
         pH, pW = psf.shape
 
         # Crop PSF if larger than canvas
@@ -570,98 +565,207 @@ class DPSSolver:
                 f"device={self.device})")
 
 
-# ── Phase 2 — Amortised Posterior Solver ─────────────────────────────────────
+# ── Phase 2 — Latent-space DPS ────────────────────────────────────────────────
 
-class AmortisedSolver:
+class LatentDPSSolver:
     """
-    Island deconvolution via amortised posterior (Phase 2).
+    Posterior sampling in VAE latent space via Flow DPS (Phase 2).
 
-    Replaces DPS's expensive N×50-step per-island sampling with a single
-    conditional flow q_φ(x_clean | dirty) trained to reproduce DPS posteriors.
-    At inference: N samples cost N × n_steps forward passes (default 20),
-    vs DPS's N × 50 — and with fewer steps because the dirty image is available
-    as conditioning, not just as a likelihood gradient correction.
+    Combines a latent flow prior p_φ(z) (LatentFlowModel, MLP) with an
+    analytic PSF likelihood gradient pushed to z-space through the VAE
+    decoder Jacobian.  This is the Phase 2 counterpart of DPSSolver.
 
-    Requires: ConditionalFlowModel trained via AmortisedPosteriorTrainer
-    (scripts/collect_dps_samples.py + scripts/train.py --variant Q).
+    Algorithm (per Euler step, t: 0 → 1)
+    --------------------------------------
+    Pre-compute:  dirty_fft = FFT(dirty_pad)
+
+    At each step:
+    1. v_z      = MLP(z_t, t)                             [prior velocity ∈ ℝ^d]
+    2. ẑ₁      = z_t + (1-t) · v_z                       [Tweedie estimate ∈ ℝ^d]
+    3. x̂₁      = Dec(ẑ₁)                                 [decode → pixels, autograd ON]
+    4. ∇_x      = PSF^T ⊛ (dirty - PSF ⊛ x̂₁) / σ²      [analytic likelihood grad]
+    5. ∇_z      = (∂x̂₁/∂ẑ₁)^T · ∇_x                     [VJP via autograd.grad]
+    6. z_{t+dt} = z_t + dt · (v_z + ζ·(1-t)·∇_z)        [corrected Euler step]
+
+    Step 5 uses torch.autograd.grad with grad_outputs=∇_x.  The decoder Jacobian
+    is never materialised — only the VJP (vector-Jacobian product) is computed,
+    making this efficient even for the 16.9M-param decoder.
+
+    x̂₁ in step 4 is detached before computing ∇_x to prevent second-order
+    gradients from flowing through the PSF FFT ops.
 
     Parameters
     ----------
-    cond_model  : ConditionalFlowModel — trained on DPS posterior samples
-    device      : str
-    n_samples   : int   — posterior draws per island (default 8)
-    n_steps     : int   — Euler ODE steps (default 20; fewer than DPS's 50)
+    vae_model   : VAEModel          — trained deterministic autoencoder
+    latent_flow : LatentFlowModel   — trained latent flow prior
+    psf         : np.ndarray (H, W) — PSF with peak=1 (CASA convention)
+    noise_std   : float             — noise level σ (default 0.05)
+    n_steps     : int               — Euler steps (default 50)
+    n_samples   : int               — independent posterior draws (default 8)
+    dps_weight  : float             — likelihood scale ζ (default 1.0)
+    device      : str               — torch device string
     """
 
     _CANVAS = 150
-    _variant_label = "C/Amortised"
+    _variant_label = "Phase2/LatentDPS"
+    _needs_peak_norm = False   # LatentDPS receives dirty in original Jy/beam units
 
     def __init__(
         self,
-        cond_model  : "ConditionalFlowModel",   # noqa: F821
-        device      : str = "cpu",
-        n_samples   : int = 8,
-        n_steps     : int = 20,
+        vae_model   : "VAEModel",          # noqa: F821
+        latent_flow : "LatentFlowModel",   # noqa: F821
+        psf         : np.ndarray,
+        noise_std   : float = 0.05,
+        n_steps     : int   = 50,
+        n_samples   : int   = 8,
+        dps_weight  : float = 1.0,
+        device      : str   = "cpu",
     ):
-        self.cond_model = cond_model
-        self.device     = torch.device(device)
-        self.n_samples  = n_samples
-        self.n_steps    = n_steps
+        self.vae         = vae_model
+        self.lf          = latent_flow
+        self.noise_std   = noise_std
+        self.n_steps     = n_steps
+        self.n_samples   = n_samples
+        self.dps_weight  = dps_weight
+        self.device      = torch.device(device)
 
-    def _run_euler(
-        self,
-        dirty    : torch.Tensor,
-        n_samples: int,
-    ) -> torch.Tensor:
-        """Conditional Euler loop. Returns (S, H_i, W_i) posterior samples."""
+        # Pre-compute PSF FFT at canvas size (same logic as DPSSolver)
+        C   = self._CANVAS
+        psf = torch.from_numpy(psf).float()
+        pH, pW = psf.shape
+        if pH > C:
+            ch  = (pH - C) // 2
+            psf = psf[ch : ch + C, :]
+            pH  = psf.shape[0]
+        if pW > C:
+            cw  = (pW - C) // 2
+            psf = psf[:, cw : cw + C]
+            pW  = psf.shape[1]
+        canvas = torch.zeros(C, C)
+        ph = (C - pH) // 2
+        pw = (C - pW) // 2
+        canvas[ph : ph + pH, pw : pw + pW] = psf
+        psf_fft = torch.fft.rfft2(torch.fft.ifftshift(canvas)).to(self.device)
+        self._psf_fft      = psf_fft
+        self._psf_fft_conj = psf_fft.conj()
+
+    def _run_euler(self, dirty: torch.Tensor, n_samples: int) -> torch.Tensor:
+        """
+        Core Euler loop.  Returns all posterior pixel-space draws.
+
+        Parameters
+        ----------
+        dirty     : (Hi, Wi) float32 Tensor on self.device
+        n_samples : number of independent z trajectories
+
+        Returns
+        -------
+        x_clean : (S, Hi, Wi) — posterior samples in pixel space
+        """
         S   = n_samples
         C   = self._CANVAS
         dev = self.device
         Hi, Wi = dirty.shape
+        d   = self.lf.latent_dim
 
-        dirty_pad  = F_.pad(dirty.to(dev), (0, C - Wi, 0, C - Hi))   # (C, C)
-        dirty_cond = dirty_pad.unsqueeze(0).unsqueeze(0).expand(S, 1, C, C)  # (S,1,C,C)
+        dirty_pad = F_.pad(dirty, (0, C - Wi, 0, C - Hi))          # (C, C)
+        dirty_fft = torch.fft.rfft2(dirty_pad).unsqueeze(0)         # (1, C//2+1)
 
-        x_t = torch.randn(S, 1, C, C, device=dev)
-        dt  = 1.0 / self.n_steps
-        net = self.cond_model._net.eval().to(dev)
+        z_t    = torch.randn(S, d, device=dev)
+        dt     = 1.0 / self.n_steps
+        sigma2 = self.noise_std ** 2
+
+        lf_net  = self.lf._net.eval().to(dev)
+        vae_net = self.vae._net.eval().to(dev)
 
         with torch.no_grad():
             for step_i in range(self.n_steps):
-                t_batch = torch.full((S,), step_i * dt, device=dev)
-                inp     = torch.cat([x_t, dirty_cond], dim=1)         # (S, 2, C, C)
-                v, _    = net(inp, t_batch)
-                x_t     = x_t + dt * v
+                t_val   = step_i * dt
+                t_batch = torch.full((S,), t_val, device=dev)
 
-        return x_t[:, 0, :Hi, :Wi]                                    # (S, Hi, Wi)
+                # 1. Prior velocity
+                v_z, _ = lf_net(z_t, t_batch)                       # (S, d)
 
-    def sample_all(
-        self,
-        dirty    : torch.Tensor,
-        n_samples: int | None = None,
-    ) -> torch.Tensor:
-        """Return all (S, H_i, W_i) posterior draws."""
-        S = n_samples if n_samples is not None else self.n_samples
-        return self._run_euler(dirty, S)
+                # 2. Tweedie estimate in z-space
+                z_hat_1 = z_t + (1.0 - t_val) * v_z                 # (S, d)
+
+                # 3–5. Decoder forward + VJP (autograd through Dec)
+                with torch.enable_grad():
+                    z_hat_1_g = z_hat_1.detach().requires_grad_(True)
+                    x_hat_1   = vae_net.decode(z_hat_1_g)            # (S, 1, C, C)
+
+                    # 4. Pixel-space likelihood gradient (analytic).
+                    # Detach x_hat_1 here so ∇_x has no grad w.r.t. z_hat_1_g —
+                    # this prevents unintended second-order gradients through FFT.
+                    xhat_fft  = torch.fft.rfft2(x_hat_1[:, 0].detach())
+                    resid_fft = dirty_fft - self._psf_fft * xhat_fft
+                    grad_x    = torch.fft.irfft2(
+                        self._psf_fft_conj * resid_fft, s=(C, C)
+                    ) / sigma2                                        # (S, C, C)
+
+                    # 5. VJP: ∇_z = (∂x̂₁/∂ẑ₁)^T · ∇_x
+                    grad_z, = torch.autograd.grad(
+                        outputs    = x_hat_1[:, 0],   # (S, C, C), has grad
+                        inputs     = z_hat_1_g,        # (S, d)
+                        grad_outputs = grad_x,         # upstream gradient
+                    )                                                 # (S, d)
+
+                # 6. Corrected Euler step
+                z_t = (z_t + dt * (
+                    v_z + self.dps_weight * (1.0 - t_val) * grad_z
+                )).detach()
+
+        # Decode final z samples to pixel space
+        with torch.no_grad():
+            x_final = vae_net.decode(z_t)                            # (S, 1, C, C)
+        return x_final[:, 0, :Hi, :Wi]
 
     def sample(
         self,
         dirty    : torch.Tensor,
         n_samples: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (mean, std), both (H_i, W_i)."""
-        x_clean = self.sample_all(dirty, n_samples)
-        S = x_clean.shape[0]
-        mean = x_clean.mean(dim=0)
-        std  = x_clean.std(dim=0) if S > 1 else torch.zeros_like(mean)
+        """
+        Draw posterior samples; return (mean, std) in pixel space.
+
+        Parameters
+        ----------
+        dirty     : (Hi, Wi) float32 Tensor
+        n_samples : override constructor n_samples if provided
+
+        Returns
+        -------
+        mean : (Hi, Wi)
+        std  : (Hi, Wi)  — zeros if n_samples == 1
+        """
+        S       = n_samples if n_samples is not None else self.n_samples
+        x_clean = self._run_euler(dirty.to(self.device), S)
+        mean    = x_clean.mean(dim=0)
+        std     = x_clean.std(dim=0) if S > 1 else torch.zeros_like(mean)
         return mean, std
 
+    def sample_all(
+        self,
+        dirty    : torch.Tensor,
+        n_samples: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Return all individual posterior draws — needed for TARP calibration.
+
+        Returns
+        -------
+        samples : (S, Hi, Wi)
+        """
+        S = n_samples if n_samples is not None else self.n_samples
+        return self._run_euler(dirty.to(self.device), S)
+
     def decode_island(self, island: torch.Tensor) -> torch.Tensor:
-        """FlowSolver-compatible interface."""
-        mean, _ = self.sample(island)
+        """FlowSolver-compatible interface: returns posterior mean."""
+        mean, _ = self.sample(island, n_samples=self.n_samples)
         return mean
 
     def __repr__(self) -> str:
-        return (f"AmortisedSolver(n_steps={self.n_steps}, "
-                f"n_samples={self.n_samples}, "
+        return (f"LatentDPSSolver(d={self.lf.latent_dim}, "
+                f"n_steps={self.n_steps}, n_samples={self.n_samples}, "
+                f"dps_weight={self.dps_weight}, noise_std={self.noise_std}, "
                 f"device={self.device})")

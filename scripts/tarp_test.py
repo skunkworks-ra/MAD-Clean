@@ -166,7 +166,7 @@ def main() -> None:
                    help="Test examples — taken from end of data file.")
     p.add_argument("--n_samples",  type=int,   default=20,
                    help="Posterior draws per example (≥20 for reliable ECP).")
-    p.add_argument("--dps_weight", type=float, default=1.0,
+    p.add_argument("--dps_weight", type=float, default=0.05,
                    help="DPS likelihood gradient scale ζ.")
     p.add_argument("--noise_std",  type=float, default=0.05)
     p.add_argument("--n_pixels",   type=int,   default=500,
@@ -181,7 +181,7 @@ def main() -> None:
     data     = np.load(args.data)
     clean_all = data["clean"].astype(np.float32)
     dirty_all = data["dirty"].astype(np.float32)
-    psf_norm  = data["psf_norm"].astype(np.float32)
+    psf_norm  = data.get("psf_norm", data.get("psf")).astype(np.float32)
     N = len(clean_all)
 
     # Use last n_test examples as held-out set
@@ -242,7 +242,7 @@ def main() -> None:
         n_pix  = min(args.n_pixels, H * W)
         pix_idx = rng.choice(H * W, size=n_pix, replace=False)
         # samples: (S, H*W) → select pixels
-        samples_flat = samples.reshape(args.n_samples, -1)[:, pix_idx]  # (S, n_pix)
+        samples_flat = samples.reshape(len(samples), -1)[:, pix_idx]  # (S, n_pix)
         truth_flat   = true_clean.ravel()[pix_idx]                       # (n_pix,)
         pixel_samples.append(samples_flat.T)    # (n_pix, S)
         pixel_truth.append(truth_flat)

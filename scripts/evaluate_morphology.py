@@ -6,12 +6,11 @@ Compares Gaussian fitting (ASP CLEAN single-component equivalent) against
 Variant A (PatchSolver), Variant B (ConvSolver+PSF), and Variant C (FlowModel)
 across the full range of source complexity.
 
-The key question: for extended sources (high flux_ratio), does the learned
-representation capture morphology that a Gaussian basis cannot?
+The key question: does the learned representation capture morphology that a
+Gaussian basis cannot, across the full range of source compactness?
 
-Flux ratio = sum(positive flux) / peak flux, computed on clean ground truth.
-Compact sources: low flux_ratio (point-like, well-described by a Gaussian).
-Extended sources: high flux_ratio (jets, lobes, diffuse — Gaussian fails here).
+Compactness = peak / total positive flux, computed on clean ground truth.
+Point sources: compactness ≈ 1.  Resolved/extended sources: compactness ≪ 1.
 
 Usage:
     pixi run -e gpu python scripts/evaluate_morphology.py \\
@@ -20,6 +19,8 @@ Usage:
         --model_b models/cdl_filters_conv.npz \\
         --model   models/flow_model.pt \\
         --prior   models/prior_model.pt \\
+        --vae     models/vae_d128.pt \\
+        --latent_prior models/latent_prior_d128.pt \\
         --out     logs/morphology_experiment \\
         --n_samples 200 \\
         --dps_samples 8 \\
@@ -144,29 +145,28 @@ def dps_reconstruct(
     return mean.cpu().numpy()
 
 
+def latent_dps_reconstruct(
+    dirty: np.ndarray,
+    latent_dps_solver,
+) -> np.ndarray:
+    """
+    Latent DPS posterior mean: flow prior in VAE z-space + analytic PSF likelihood.
+    Returns (H, W) float32 posterior mean.
+    """
+    import torch
+    island = torch.from_numpy(dirty).float()
+    mean, _ = latent_dps_solver.sample(island)
+    return mean.cpu().numpy()
+
+
 # ---------------------------------------------------------------------------
 # Stratified sampling
 # ---------------------------------------------------------------------------
 
-def stratified_sample(flux_ratios: np.ndarray, n_total: int, seed: int = 42) -> np.ndarray:
-    """
-    Sample n_total indices stratified across the flux_ratio range.
-    Ensures representation from compact, intermediate, and extended sources.
-    """
+def random_sample(n_sources: int, n_total: int, seed: int = 42) -> np.ndarray:
+    """Return n_total randomly sampled indices from [0, n_sources)."""
     rng = np.random.default_rng(seed)
-    quartiles = np.quantile(flux_ratios, [0.25, 0.5, 0.75])
-    bins = [
-        np.where(flux_ratios <= quartiles[0])[0],
-        np.where((flux_ratios > quartiles[0]) & (flux_ratios <= quartiles[1]))[0],
-        np.where((flux_ratios > quartiles[1]) & (flux_ratios <= quartiles[2]))[0],
-        np.where(flux_ratios > quartiles[2])[0],
-    ]
-    per_bin = n_total // 4
-    idx = np.concatenate([
-        rng.choice(b, size=min(per_bin, len(b)), replace=False)
-        for b in bins
-    ])
-    return idx
+    return rng.choice(n_sources, size=min(n_total, n_sources), replace=False)
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +175,12 @@ def stratified_sample(flux_ratios: np.ndarray, n_total: int, seed: int = 42) -> 
 
 # Consistent colour/label map for all methods
 _METHOD_STYLE = {
-    "gauss":  {"color": "#e07b39", "label": "Gaussian fit"},
-    "var_a":  {"color": "#2ca02c", "label": "Variant A (patch)"},
-    "var_b":  {"color": "#9467bd", "label": "Variant B (conv+PSF)"},
-    "flow":   {"color": "#3a86ff", "label": "Variant C (flow)"},
-    "dps":    {"color": "#d62728", "label": "DPS (prior + likelihood)"},
+    "gauss":      {"color": "#e07b39", "label": "Gaussian fit"},
+    "var_a":      {"color": "#2ca02c", "label": "Variant A (patch)"},
+    "var_b":      {"color": "#9467bd", "label": "Variant B (conv+PSF)"},
+    "flow":       {"color": "#3a86ff", "label": "Variant C (flow)"},
+    "dps":        {"color": "#d62728", "label": "DPS (prior + likelihood)"},
+    "latent_dps": {"color": "#ff7f0e", "label": "Latent DPS (VAE z-space)"},
 }
 
 
@@ -216,10 +217,8 @@ def plot_scatter(flux_ratios, method_metrics: dict, out_dir: Path) -> None:
             x_smooth = np.sort(flux_ratios)[window // 2: window // 2 + len(smooth)]
             ax.plot(x_smooth, smooth, color=style["color"], linewidth=2, zorder=4)
 
-        ax.set_xlabel("Flux ratio  (sum positive / peak)", fontsize=10)
+        ax.set_xlabel("Compactness  (peak / total positive flux)", fontsize=10)
         ax.set_ylabel(ylabel, fontsize=10)
-        ax.axvline(50, color="gray", linestyle="--", alpha=0.4,
-                   label="compact/extended boundary")
         ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
 
@@ -271,9 +270,9 @@ def plot_examples(
             if row == 0:
                 ax.set_title(title, fontsize=9, fontweight="bold")
             if col == 0:
-                ax.set_ylabel(f"flux_ratio={flux_ratios[idx]:.0f}", fontsize=9)
+                ax.set_ylabel(f"compactness={flux_ratios[idx]:.3f}", fontsize=9)
 
-    plt.suptitle("Extended source reconstruction — most complex examples", fontsize=11)
+    plt.suptitle("Low-compactness source reconstruction — most extended examples", fontsize=11)
     plt.tight_layout()
     path = out_dir / "example_extended_sources.png"
     plt.savefig(path, dpi=150)
@@ -299,6 +298,10 @@ def main() -> None:
                    help="Variant C FlowModel .pt. Skip if not found.")
     p.add_argument("--prior",      default="models/prior_model.pt",
                    help="DPS prior FlowModel .pt (PriorTrainer output). Skip if not found.")
+    p.add_argument("--vae",        default="models/vae_d128.pt",
+                   help="VAEModel .pt for Phase 2 latent DPS. Skip if not found.")
+    p.add_argument("--latent_prior", default="models/latent_prior_d128.pt",
+                   help="LatentFlowModel .pt for Phase 2 latent DPS. Skip if not found.")
     p.add_argument("--dps_samples", type=int,   default=8,
                    help="Posterior draws per island for DPS.")
     p.add_argument("--dps_weight",  type=float, default=1.0,
@@ -337,20 +340,23 @@ def main() -> None:
 
     # PSF for Variant B — must match the normalisation used at training time.
     # train.py feeds data["psf_norm"] to ConvDictTrainer, so we use the same key.
-    psf_norm = data["psf_norm"].astype(np.float32) if "psf_norm" in data else None
+    psf_norm = None
+    for _psf_key in ("psf_norm", "psf"):
+        if _psf_key in data:
+            psf_norm = data[_psf_key].astype(np.float32)
+            break
     if psf_norm is None:
-        print("WARNING: 'psf_norm' key not found in data file — Variant B will run without PSF.")
+        print("WARNING: no PSF key found in data file — Variant B and DPS will be skipped.")
 
-    # ── Flux ratio stratification ──────────────────────────────────────────────
-    flux_ratios = (
-        np.sum(np.clip(clean, 0, None), axis=(1, 2))
-        / (clean.max(axis=(1, 2)) + 1e-8)
-    )
-    print(f"Flux ratio  min={flux_ratios.min():.1f}  "
-          f"median={np.median(flux_ratios):.1f}  max={flux_ratios.max():.1f}")
+    # ── Compactness (peak / total positive flux) ───────────────────────────────
+    total_flux  = np.sum(np.clip(clean, 0, None), axis=(1, 2))
+    peak_flux   = clean.max(axis=(1, 2))
+    flux_ratios = peak_flux / (total_flux + 1e-8)   # 1.0 = point source, ≪1 = resolved
+    print(f"Compactness  min={flux_ratios.min():.3f}  "
+          f"median={np.median(flux_ratios):.3f}  max={flux_ratios.max():.3f}")
 
-    sample_idx = stratified_sample(flux_ratios, args.n_samples)
-    print(f"Sampled {len(sample_idx)} sources (stratified across flux_ratio range)")
+    sample_idx = random_sample(len(clean), args.n_samples)
+    print(f"Sampled {len(sample_idx)} sources (random)")
 
     # ── Load Variant A (PatchSolver) ──────────────────────────────────────────
     solver_a = None
@@ -428,6 +434,40 @@ def main() -> None:
     else:
         print(f"Prior model not found at {prior_path} — skipping DPS.")
 
+    # ── Load Latent DPS solver (VAE + latent flow + explicit likelihood) ──────
+    latent_dps_solver = None
+    vae_path    = Path(args.vae)
+    lprior_path = Path(args.latent_prior)
+    if vae_path.exists() and lprior_path.exists():
+        try:
+            from mad_clean.training.vae import VAEModel
+            from mad_clean.training.latent_flow import LatentFlowModel
+            from mad_clean.solvers import LatentDPSSolver
+            vae_model    = VAEModel.load(str(vae_path), device=device)
+            latent_flow  = LatentFlowModel.load(str(lprior_path), device=device)
+            if psf_norm is None:
+                print("WARNING: Latent DPS requires psf_norm — skipping (no psf_norm in data).")
+            else:
+                if device == "cpu":
+                    print("WARNING: Latent DPS on CPU is slow (50 steps × n_samples × decoder backward). "
+                          "Consider --device cuda.")
+                latent_dps_solver = LatentDPSSolver(
+                    vae_model   = vae_model,
+                    latent_flow = latent_flow,
+                    psf_norm    = psf_norm,
+                    noise_std   = args.noise_std,
+                    n_steps     = 50,
+                    n_samples   = args.dps_samples,
+                    dps_weight  = args.dps_weight,
+                    device      = device,
+                )
+                print(f"Latent DPS solver loaded: {latent_dps_solver}")
+        except Exception as e:
+            print(f"WARNING: could not load Latent DPS solver — {e}")
+    else:
+        missing = [str(p) for p in [vae_path, lprior_path] if not p.exists()]
+        print(f"Latent DPS models not found ({', '.join(missing)}) — skipping.")
+
     # ── Evaluation loop ────────────────────────────────────────────────────────
     # Per-method metric lists and reconstruction stores
     g_corr,  g_rms,  g_flux_rec  = [], [], []
@@ -435,12 +475,14 @@ def main() -> None:
     b_corr,  b_rms,  b_flux_rec  = [], [], []
     f_corr,  f_rms,  f_flux_rec  = [], [], []
     d_corr,  d_rms,  d_flux_rec  = [], [], []
+    ld_corr, ld_rms, ld_flux_rec = [], [], []
 
-    gauss_recons = []
-    varA_recons  = []
-    varB_recons  = []
-    flow_recons  = []
-    dps_recons   = []
+    gauss_recons     = []
+    varA_recons      = []
+    varB_recons      = []
+    flow_recons      = []
+    dps_recons       = []
+    latent_dps_recons = []
 
     failed_gauss = 0
 
@@ -496,6 +538,14 @@ def main() -> None:
             d_rms.append(residual_rms(recon, c_img))
             d_flux_rec.append(flux_recovery(recon, c_img))
 
+        # Latent DPS (VAE z-space prior + explicit likelihood)
+        if latent_dps_solver is not None:
+            recon = latent_dps_reconstruct(d_img, latent_dps_solver)
+            latent_dps_recons.append(recon)
+            ld_corr.append(pearson_corr(recon, c_img))
+            ld_rms.append(residual_rms(recon, c_img))
+            ld_flux_rec.append(flux_recovery(recon, c_img))
+
         if (k + 1) % 50 == 0:
             print(f"  {k + 1}/{len(sample_idx)} evaluated")
 
@@ -504,20 +554,14 @@ def main() -> None:
 
     # ── Summary statistics ─────────────────────────────────────────────────────
     sampled_ratios = flux_ratios[sample_idx]
-    compact_mask   = sampled_ratios < 50
-    extended_mask  = sampled_ratios > 100
 
     def _print_summary(label, corr, rms, flux_rec):
+        n = len(sample_idx)
         print(f"\n── {label} {'─' * max(0, 44 - len(label))}")
-        for name, mask in [("all", np.ones(len(sample_idx), bool)),
-                           ("compact (ratio<50)", compact_mask),
-                           ("extended (ratio>100)", extended_mask)]:
-            if mask.sum() == 0:
-                continue
-            print(f"  {name:25s}  n={mask.sum():4d}  "
-                  f"corr={np.mean(np.array(corr)[mask]):.3f}  "
-                  f"rms={np.mean(np.array(rms)[mask]):.4f}  "
-                  f"flux_rec={np.mean(np.array(flux_rec)[mask]):.3f}")
+        print(f"  n={n:4d}  "
+              f"corr={np.mean(corr):.3f}  "
+              f"rms={np.mean(rms):.4f}  "
+              f"flux_rec={np.mean(flux_rec):.3f}")
 
     _print_summary("Gaussian fit", g_corr, g_rms, g_flux_rec)
     if solver_a is not None:
@@ -528,6 +572,8 @@ def main() -> None:
         _print_summary("Variant C (flow)", f_corr, f_rms, f_flux_rec)
     if dps_solver is not None:
         _print_summary("DPS (prior+likelihood)", d_corr, d_rms, d_flux_rec)
+    if latent_dps_solver is not None:
+        _print_summary("Latent DPS (VAE z-space)", ld_corr, ld_rms, ld_flux_rec)
 
     # ── Plots ──────────────────────────────────────────────────────────────────
     method_metrics = {"gauss": {"corr": g_corr, "rms": g_rms}}
@@ -538,12 +584,14 @@ def main() -> None:
     if fm is not None:
         method_metrics["flow"]  = {"corr": f_corr, "rms": f_rms}
     if dps_solver is not None:
-        method_metrics["dps"]   = {"corr": d_corr, "rms": d_rms}
+        method_metrics["dps"]        = {"corr": d_corr,  "rms": d_rms}
+    if latent_dps_solver is not None:
+        method_metrics["latent_dps"] = {"corr": ld_corr, "rms": ld_rms}
 
     plot_scatter(sampled_ratios, method_metrics, out_dir)
 
-    # Most extended sources for the panel plot
-    top_extended = np.argsort(sampled_ratios)[-4:][::-1]
+    # Most extended (lowest compactness) sources for the panel plot
+    top_extended = np.argsort(sampled_ratios)[:4]
     method_recons_panel = {}
     if varA_recons:
         method_recons_panel["var_a"] = [varA_recons[i] for i in top_extended]
@@ -552,7 +600,9 @@ def main() -> None:
     if flow_recons:
         method_recons_panel["flow"]  = [flow_recons[i] for i in top_extended]
     if dps_recons:
-        method_recons_panel["dps"]   = [dps_recons[i]  for i in top_extended]
+        method_recons_panel["dps"]        = [dps_recons[i]       for i in top_extended]
+    if latent_dps_recons:
+        method_recons_panel["latent_dps"] = [latent_dps_recons[i] for i in top_extended]
 
     plot_examples(
         sample_idx[top_extended],
@@ -564,12 +614,13 @@ def main() -> None:
     )
 
     # ── Save CSV ───────────────────────────────────────────────────────────────
-    header = ["idx", "flux_ratio",
-              "gauss_corr", "gauss_rms", "gauss_flux_rec",
-              "varA_corr",  "varA_rms",  "varA_flux_rec",
-              "varB_corr",  "varB_rms",  "varB_flux_rec",
-              "flow_corr",  "flow_rms",  "flow_flux_rec",
-              "dps_corr",   "dps_rms",   "dps_flux_rec"]
+    header = ["idx", "compactness",
+              "gauss_corr",     "gauss_rms",     "gauss_flux_rec",
+              "varA_corr",      "varA_rms",      "varA_flux_rec",
+              "varB_corr",      "varB_rms",      "varB_flux_rec",
+              "flow_corr",      "flow_rms",      "flow_flux_rec",
+              "dps_corr",       "dps_rms",       "dps_flux_rec",
+              "latent_dps_corr","latent_dps_rms","latent_dps_flux_rec"]
     rows = [header]
     for k, idx in enumerate(sample_idx):
         def _fmt(lst, i):
@@ -581,6 +632,7 @@ def main() -> None:
             _fmt(b_corr, k), _fmt(b_rms, k), _fmt(b_flux_rec, k),
             _fmt(f_corr, k), _fmt(f_rms, k), _fmt(f_flux_rec, k),
             _fmt(d_corr, k), _fmt(d_rms, k), _fmt(d_flux_rec, k),
+            _fmt(ld_corr, k), _fmt(ld_rms, k), _fmt(ld_flux_rec, k),
         ])
     csv_path = out_dir / "metrics.csv"
     with open(csv_path, "w") as fh:

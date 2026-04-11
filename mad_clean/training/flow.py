@@ -410,6 +410,7 @@ class FlowTrainer:
         clean       : np.ndarray,
         device      : str = "cpu",
         resume_from : Optional[str | Path] = None,
+        out_path    : Optional[str | Path] = None,
     ) -> FlowModel:
         """
         Train on paired (N, H, W) dirty and clean float32 images.
@@ -437,13 +438,19 @@ class FlowTrainer:
             fm = FlowModel(device=device)
         optimizer = torch.optim.Adam(fm._net.parameters(), lr=self.lr)
 
+        best_path = Path(out_path).with_suffix(".best.pt") if out_path is not None else None
+        best_loss = float("inf")
+
         print(f"FlowTrainer (dirty→clean): N={N}  {H}×{W}  "
               f"batch={self.batch_size}  epochs={self.n_epochs}  device={dev}")
+        if best_path is not None:
+            print(f"  Best checkpoint → {best_path}")
 
         for epoch in range(self.n_epochs):
-            idx        = rng.permutation(N)
-            epoch_loss = 0.0
-            n_batches  = 0
+            idx           = rng.permutation(N)
+            epoch_loss    = 0.0
+            epoch_sigma   = 0.0
+            n_batches     = 0
 
             fm._net.train()
             for b_start in range(0, N, self.batch_size):
@@ -475,15 +482,22 @@ class FlowTrainer:
                     (v_pred - u_target) ** 2 / log_var.exp() + log_var
                 ).mean()
                 loss.backward()
+                nn.utils.clip_grad_norm_(fm._net.parameters(), max_norm=1.0)
                 optimizer.step()
 
-                epoch_loss += float(loss)
-                n_batches  += 1
+                epoch_loss  += float(loss)
+                epoch_sigma += log_var.detach().mul(0.5).exp().mean().item()
+                n_batches   += 1
 
-            mean_sigma = log_var.detach().mul(0.5).exp().mean().item()
+            avg_loss = epoch_loss / n_batches
             print(f"  Epoch {epoch + 1:3d}/{self.n_epochs}  "
-                  f"loss={epoch_loss / n_batches:.3e}  "
-                  f"mean_sigma={mean_sigma:.3f}", flush=True)
+                  f"loss={avg_loss:.3e}  "
+                  f"mean_sigma={epoch_sigma / n_batches:.3f}", flush=True)
+
+            if best_path is not None and avg_loss < best_loss:
+                best_loss = avg_loss
+                fm.save(best_path)
+                print(f"    ↳ best checkpoint saved (loss={best_loss:.3e})", flush=True)
 
         fm._net.eval()
         return fm
@@ -542,6 +556,7 @@ class PriorTrainer:
         clean       : np.ndarray,
         device      : str = "cpu",
         resume_from : Optional[str | Path] = None,
+        out_path    : Optional[str | Path] = None,
     ) -> FlowModel:
         """
         Train on (N, H, W) clean float32 images — no dirty images needed.
@@ -552,6 +567,8 @@ class PriorTrainer:
         device      : torch device string
         resume_from : path to an existing .pt checkpoint to resume from.
                       Loads weights before training; n_epochs additional epochs run.
+        out_path    : if provided, best model (lowest loss) is saved to
+                      out_path.with_suffix('.best.pt') after every improvement.
         """
         dev = torch.device(device)
         rng = np.random.default_rng(self.random_seed)
@@ -564,13 +581,19 @@ class PriorTrainer:
             fm = FlowModel(device=device)
         optimizer = torch.optim.Adam(fm._net.parameters(), lr=self.lr)
 
+        best_path = Path(out_path).with_suffix(".best.pt") if out_path is not None else None
+        best_loss = float("inf")
+
         print(f"PriorTrainer (noise→clean): N={N}  {H}×{W}  "
               f"batch={self.batch_size}  epochs={self.n_epochs}  device={dev}")
+        if best_path is not None:
+            print(f"  Best checkpoint → {best_path}")
 
         for epoch in range(self.n_epochs):
-            idx        = rng.permutation(N)
-            epoch_loss = 0.0
-            n_batches  = 0
+            idx           = rng.permutation(N)
+            epoch_loss    = 0.0
+            epoch_sigma   = 0.0
+            n_batches     = 0
 
             fm._net.train()
             for b_start in range(0, N, self.batch_size):
@@ -596,15 +619,22 @@ class PriorTrainer:
                     (v_pred - u_target) ** 2 / log_var.exp() + log_var
                 ).mean()
                 loss.backward()
+                nn.utils.clip_grad_norm_(fm._net.parameters(), max_norm=1.0)
                 optimizer.step()
 
-                epoch_loss += float(loss)
-                n_batches  += 1
+                epoch_loss  += float(loss)
+                epoch_sigma += log_var.detach().mul(0.5).exp().mean().item()
+                n_batches   += 1
 
-            mean_sigma = log_var.detach().mul(0.5).exp().mean().item()
+            avg_loss = epoch_loss / n_batches
             print(f"  Epoch {epoch + 1:3d}/{self.n_epochs}  "
-                  f"loss={epoch_loss / n_batches:.3e}  "
-                  f"mean_sigma={mean_sigma:.3f}", flush=True)
+                  f"loss={avg_loss:.3e}  "
+                  f"mean_sigma={epoch_sigma / n_batches:.3f}", flush=True)
+
+            if best_path is not None and avg_loss < best_loss:
+                best_loss = avg_loss
+                fm.save(best_path)
+                print(f"    ↳ best checkpoint saved (loss={best_loss:.3e})", flush=True)
 
         fm._net.eval()
         return fm
