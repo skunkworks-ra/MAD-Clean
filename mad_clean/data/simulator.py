@@ -94,9 +94,16 @@ class GPUSimulator:
         self._rng.manual_seed(seed)
 
         # --- load clean images to GPU ---
+        # Accepts npz files with either 'images' key (crumb_preprocessed.npz)
+        # or 'clean' key (flow_pairs_vla.npz).
         data_path = Path(data_path)
         raw = np.load(data_path)
-        images = raw["images"].astype(np.float32)   # (N, H, W)
+        if "images" in raw:
+            images = raw["images"].astype(np.float32)
+        elif "clean" in raw:
+            images = raw["clean"].astype(np.float32)
+        else:
+            raise KeyError(f"{data_path} must contain an 'images' or 'clean' key")
         self.N, self.H, self.W = images.shape
         self._clean = torch.from_numpy(images).to(self.device)  # (N, H, W)
 

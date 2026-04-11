@@ -10,22 +10,24 @@ Variant B  (convolutional CDL, PSF-residual):
     mad-train --variant B --data crumb_data/flow_pairs.npz \\
         --out models/cdl_filters_conv --k 32 --atom_size 15 [--device cuda]
 
-Variant C  (conditional flow matching):
-    mad-train --variant C --data crumb_data/flow_pairs.npz \\
-        --out models/flow_model.pt [--resume models/flow_model.pt] [--device cuda]
+Variant C  (conditional flow matching, on-the-fly GPU simulation):
+    mad-train --variant C --data crumb_data/crumb_preprocessed.npz \\
+        --psf crumb_data/flow_pairs_vla.npz \\
+        --out models/flow_model.pt [--n_epochs 100] [--lr 1e-4] \\
+        [--vram_budget_gb 32] [--resume models/flow_model.pt] [--device cuda]
 
-Variant P  (unconditional prior — clean images only):
-    mad-train --variant P --data crumb_data/flow_pairs_vla.npz \\
-        --out models/prior_model.pt [--n_epochs 500] [--batch_size 16] [--device cuda]
+Variant P  (unconditional prior, on-the-fly GPU simulation):
+    mad-train --variant P --data crumb_data/crumb_preprocessed.npz \\
+        --psf crumb_data/flow_pairs_vla.npz \\
+        --out models/prior_model.pt [--n_epochs 500] [--lr 1e-4] \\
+        [--vram_budget_gb 32] [--device cuda]
 
 Variant V  (VAE — clean images only, Phase 2):
     mad-train --variant V --data crumb_data/flow_pairs_vla.npz \\
         --out models/vae_d128.pt [--latent_dim 128] [--beta 1.0] [--device cuda]
 
-The --data file must be a .npz produced by scripts/simulate.py, with keys:
-    clean     (N, H, W) float32
-    dirty     (N, H, W) float32
-    psf       (H, W)    float32  [required for Variant B]
+Variants C and P use GPUSimulator: --data must be crumb_preprocessed.npz (images key),
+--psf must be a .npz with a 'psf' key (peak=1) or a .npy/.fits PSF file.
 """
 
 import argparse
@@ -34,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
+from mad_clean.data.simulator import GPUSimulator
 from mad_clean.training import (
     PatchDictTrainer, ConvDictTrainer,
     FlowTrainer, PriorTrainer,
@@ -76,8 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fista_iter_train", type=int,   default=50,
                    help="[B] FISTA iterations per Z-step during training")
 
-    p.add_argument("--lr",     type=float, default=1e-4,
-                   help="[C] Adam learning rate for FlowTrainer")
+    p.add_argument("--lr",             type=float, default=1e-4,
+                   help="[C/P] Adam learning rate for FlowTrainer / PriorTrainer")
+    p.add_argument("--vram_budget_gb", type=float, default=32.0,
+                   help="[C/P] GPU VRAM budget in GB for GPUSimulator batch sizing")
+    p.add_argument("--noise_std",      type=float, default=0.05,
+                   help="[C/P] Gaussian noise std added to dirty images (Jy/beam)")
     p.add_argument("--resume", default=None,
                    help="[C/P/V] Path to existing .pt checkpoint to resume from")
     p.add_argument("--num_workers", type=int, default=4,
@@ -159,26 +166,38 @@ def main() -> None:
         trainer.save(out_path, fb)
 
     elif args.variant == "C":
-        if dirty is None:
-            print("ERROR: --variant C requires dirty images. Run scripts/simulate.py first.",
+        if "psf" not in data:
+            print("ERROR: --variant C requires a 'psf' key in the .npz data file.",
                   file=sys.stderr)
             sys.exit(1)
-        trainer = FlowTrainer(
-            n_epochs   = args.n_epochs,
-            batch_size = args.batch_size,
-            lr         = args.lr,
+        psf = data["psf"].astype(np.float32)
+        simulator = GPUSimulator(
+            data_path      = data_path,
+            psf            = psf,
+            noise_std      = args.noise_std,
+            vram_budget_gb = args.vram_budget_gb,
+            device         = args.device,
         )
-        fm = trainer.fit(dirty, clean, device=args.device, resume_from=args.resume,
+        trainer = FlowTrainer(n_epochs=args.n_epochs, lr=args.lr)
+        fm = trainer.fit(simulator, device=args.device, resume_from=args.resume,
                          out_path=out_path)
         fm.save(out_path)
 
     elif args.variant == "P":
-        trainer = PriorTrainer(
-            n_epochs   = args.n_epochs,
-            batch_size = args.batch_size,
-            lr         = args.lr,
+        if "psf" not in data:
+            print("ERROR: --variant P requires a 'psf' key in the .npz data file.",
+                  file=sys.stderr)
+            sys.exit(1)
+        psf = data["psf"].astype(np.float32)
+        simulator = GPUSimulator(
+            data_path      = data_path,
+            psf            = psf,
+            noise_std      = args.noise_std,
+            vram_budget_gb = args.vram_budget_gb,
+            device         = args.device,
         )
-        fm = trainer.fit(clean, device=args.device, resume_from=args.resume,
+        trainer = PriorTrainer(n_epochs=args.n_epochs, lr=args.lr)
+        fm = trainer.fit(simulator, device=args.device, resume_from=args.resume,
                          out_path=out_path)
         fm.save(out_path)
 
