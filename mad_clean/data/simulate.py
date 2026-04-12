@@ -132,7 +132,15 @@ class SimulateObservations:
         psf_path  : str | Path | None  = None,
         noise_std : float              = 0.05,
         seed      : int                = 42,
+        normalise : bool               = True,
     ):
+        """
+        Parameters
+        ----------
+        normalise : if True (default), apply per-image peak normalisation before
+                    convolution — clean_n = clean / peak, range [0, 1].
+                    Set False when training used raw physical units (Option C / SBI).
+        """
         if psf_fwhm is None and psf_path is None:
             raise ValueError("Provide either psf_fwhm or psf_path")
         if psf_fwhm is not None and psf_path is not None:
@@ -142,6 +150,7 @@ class SimulateObservations:
         self.psf_path  = Path(psf_path) if psf_path is not None else None
         self.noise_std = noise_std
         self.seed      = seed
+        self.normalise = normalise
 
     def run(self, data_path: str | Path, out: str | Path) -> None:
         """
@@ -160,11 +169,14 @@ class SimulateObservations:
         N, H, W = clean.shape
         print(f"Loaded {N} clean images  shape={H}×{W}")
 
-        # Per-image peak normalisation: map each image to [0, 1].
-        # Both clean and dirty are divided by the same peak so the
-        # flux relationship between them is preserved for training.
-        peak    = clean.max(axis=(1, 2), keepdims=True) + 1e-8
-        clean_n = clean / peak
+        if self.normalise:
+            # Per-image peak normalisation: map each image to [0, 1].
+            peak    = clean.max(axis=(1, 2), keepdims=True) + 1e-8
+            clean_n = clean / peak
+        else:
+            # Raw physical units — no normalisation (SBI / Option C training).
+            clean_n = clean
+        print(f"Normalisation: {'peak (range [0,1])' if self.normalise else 'none (raw flux)'}")
 
         if self.psf_fwhm is not None:
             psf = _make_gaussian_psf(self.psf_fwhm, size=max(H, W))

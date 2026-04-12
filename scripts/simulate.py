@@ -33,9 +33,12 @@ def main() -> None:
                    help="PSF file path (.fits, .npy, or .npz). Mutually exclusive with --psf_fwhm.")
     p.add_argument("--psf_fwhm",  type=float, default=None,
                    help="Synthetic Gaussian PSF FWHM in pixels. Mutually exclusive with --psf.")
-    p.add_argument("--noise_std", type=float, default=0.05,
+    p.add_argument("--noise_std",     type=float, default=0.05,
                    help="Gaussian noise std added to each dirty image")
-    p.add_argument("--seed",      type=int,   default=42)
+    p.add_argument("--seed",          type=int,   default=42)
+    p.add_argument("--no_normalise",  action="store_true",
+                   help="Skip per-image peak normalisation. Use when training was done "
+                        "on raw flux (Option C / physical units).")
     args = p.parse_args()
 
     if args.psf is None and args.psf_fwhm is None:
@@ -44,10 +47,11 @@ def main() -> None:
         p.error("--psf and --psf_fwhm are mutually exclusive")
 
     sim = SimulateObservations(
-        psf_fwhm  = args.psf_fwhm,
-        psf_path  = args.psf,
-        noise_std = args.noise_std,
-        seed      = args.seed,
+        psf_fwhm    = args.psf_fwhm,
+        psf_path    = args.psf,
+        noise_std   = args.noise_std,
+        seed        = args.seed,
+        normalise   = not args.no_normalise,
     )
     sim.run(args.data, out=args.out)
 
