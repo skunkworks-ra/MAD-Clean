@@ -165,8 +165,9 @@ class UNetVelocityField(nn.Module):
         self.down2 = _Downsample(64)             # (B, 64,   37,  37) [floor]
 
         # Bottleneck
-        self.bot1  = _ConvBlock(64,  128, td)  # (B, 128,  37,  37)
-        self.bot2  = _ConvBlock(128, 128, td)  # (B, 128,  37,  37)
+        self.bot1    = _ConvBlock(64,  128, td)  # (B, 128,  37,  37)
+        self.dropout = nn.Dropout2d(p=0.1)        # regularise bottleneck features
+        self.bot2    = _ConvBlock(128, 128, td)  # (B, 128,  37,  37)
 
         # Decoder — skip channels are concatenated before the conv block
         self.up2   = _Upsample(128)              # (B, 128,  74,  74) → pad to 75
@@ -199,6 +200,7 @@ class UNetVelocityField(nn.Module):
         e1   = self.enc1(x,           temb)   # (B, 32,  H,    W)
         e2   = self.enc2(self.down1(e1), temb) # (B, 64,  H//2, W//2)
         b    = self.bot1(self.down2(e2), temb) # (B, 128, H//4, W//4)  [floored]
+        b    = self.dropout(b)
         b    = self.bot2(b,           temb)
 
         # Decoder — bilinear upsample may differ from encoder size by 1 pixel;
@@ -398,7 +400,8 @@ class FlowTrainer:
             print(f"Resuming from {resume_from} — running {self.n_epochs} additional epochs")
         else:
             fm = FlowModel(device=device)
-        optimizer = torch.optim.Adam(fm._net.parameters(), lr=self.lr)
+        optimizer = torch.optim.Adam(fm._net.parameters(), lr=self.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.n_epochs)
 
         best_path = Path(out_path).with_suffix(".best.pt") if out_path is not None else None
         best_loss = float("inf")
@@ -441,6 +444,8 @@ class FlowTrainer:
             print(f"  Epoch {epoch + 1:3d}/{self.n_epochs}  "
                   f"loss={avg_loss:.3e}  "
                   f"mean_sigma={epoch_sigma / n_batches:.3f}", flush=True)
+
+            scheduler.step()
 
             if best_path is not None and avg_loss < best_loss:
                 best_loss = avg_loss
@@ -522,7 +527,8 @@ class PriorTrainer:
             print(f"Resuming from {resume_from} — running {self.n_epochs} additional epochs")
         else:
             fm = FlowModel(device=device)
-        optimizer = torch.optim.Adam(fm._net.parameters(), lr=self.lr)
+        optimizer = torch.optim.Adam(fm._net.parameters(), lr=self.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.n_epochs)
 
         best_path = Path(out_path).with_suffix(".best.pt") if out_path is not None else None
         best_loss = float("inf")
@@ -570,6 +576,8 @@ class PriorTrainer:
             print(f"  Epoch {epoch + 1:3d}/{self.n_epochs}  "
                   f"loss={avg_loss:.3e}  "
                   f"mean_sigma={epoch_sigma / n_batches:.3f}", flush=True)
+
+            scheduler.step()
 
             if best_path is not None and avg_loss < best_loss:
                 best_loss = avg_loss
