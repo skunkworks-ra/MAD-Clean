@@ -118,11 +118,13 @@ class GPUSimulator:
         # --- padding size for linear FFT convolution ---
         self._pad = _next_pow2(2 * max(self.H, self.W))
 
-        # batch_size is derived from vram_budget_gb: budget / dataset size,
-        # capped at N. Tune vram_budget_gb down if OOM during training.
-        dataset_bytes   = self._clean.element_size() * self._clean.numel()
-        budget_bytes    = int(vram_budget_gb * 1024 ** 3)
-        self.batch_size = max(1, min(self.N, budget_bytes // dataset_bytes * self.N // 4))
+        # batch_size: budget / (50 × raw image size).
+        # The 50× factor is a conservative headroom for UNet activations and gradients.
+        # Tune vram_budget_gb down if OOM.
+        dataset_bytes    = self._clean.element_size() * self._clean.numel()
+        budget_bytes     = int(vram_budget_gb * 1024 ** 3)
+        bytes_per_sample = self.H * self.W * 4 * 50
+        self.batch_size  = max(1, min(self.N, budget_bytes // bytes_per_sample))
 
         print(
             f"GPUSimulator: N={self.N}  {self.H}×{self.W}  "
