@@ -109,6 +109,7 @@ def flowmodel_reconstruct(
     dirty: np.ndarray,
     fm,
     device: str,
+    beam_area: float | None = None,
     n_steps: int = 20,
     n_samples: int = 1,
     perturb_std: float = 0.0,
@@ -116,19 +117,37 @@ def flowmodel_reconstruct(
     """
     ODE integration: dirty → clean estimate.
 
+    Normalisation: dirty is peak-normalised before the model, then rescaled back
+    to physical flux units via dirty.sum / beam_area (beam area correction).
+    beam_area = psf.sum() for peak=1 PSF (≈448 for VLA).
+    If beam_area is None, no rescaling is applied (output remains in normalised units).
+
     n_samples=1, perturb_std=0.0 : deterministic Euler (mean prediction, blurrier)
     n_samples>1, perturb_std>0   : stochastic ensemble mean (sharper, more variance)
     """
     import torch
     from mad_clean.solvers import FlowSolver
+
+    dirty_peak = float(np.abs(dirty).max()) + 1e-8
+    dirty_norm = dirty / dirty_peak
+
     solver = FlowSolver(
         fm, device=device,
         n_samples=n_samples,
         n_steps=n_steps,
         perturb_std=perturb_std,
     )
-    island = torch.from_numpy(dirty).float().to(device)
-    return solver.decode_island(island).cpu().numpy()
+    island = torch.from_numpy(dirty_norm).float().to(device)
+    recon_norm = solver.decode_island(island).cpu().numpy()
+
+    if beam_area is not None:
+        # Rescale to physical flux units via beam area relationship:
+        #   dirty.sum ≈ clean.sum × beam_area  →  clean.sum ≈ dirty.sum / beam_area
+        # Preserve morphology from recon_norm, set total flux to physical value.
+        total_flux = float(np.clip(dirty, 0, None).sum()) / beam_area
+        pos_sum    = float(np.clip(recon_norm, 0, None).sum()) + 1e-8
+        return recon_norm / pos_sum * total_flux
+    return recon_norm * dirty_peak
 
 
 def dps_reconstruct(
@@ -348,6 +367,17 @@ def main() -> None:
     if psf_norm is None:
         print("WARNING: no PSF key found in data file — Variant B and DPS will be skipped.")
 
+    # Peak=1 PSF for beam area correction: dirty.sum ≈ clean.sum × psf_peak1.sum
+    # psf_area scalar is stored by simulate.py; fall back to computing from peak=1 PSF.
+    psf_peak1 = data["psf"].astype(np.float32) if "psf" in data else None
+    if "psf_area" in data:
+        beam_area = float(data["psf_area"])
+    elif psf_peak1 is not None:
+        beam_area = float(psf_peak1.sum())
+    else:
+        beam_area = None
+        print("WARNING: no psf_area or psf key — FlowModel beam area correction disabled.")
+
     # ── Compactness (peak / total positive flux) ───────────────────────────────
     total_flux  = np.sum(np.clip(clean, 0, None), axis=(1, 2))
     peak_flux   = clean.max(axis=(1, 2))
@@ -522,6 +552,7 @@ def main() -> None:
         if fm is not None:
             recon = flowmodel_reconstruct(
                 d_img, fm, device,
+                beam_area=beam_area,
                 n_samples=args.flow_samples,
                 perturb_std=args.flow_perturb,
             )
