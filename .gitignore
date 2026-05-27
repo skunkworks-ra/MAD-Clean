@@ -172,11 +172,17 @@ marimo/_lsp/
 __marimo__/
 
 # MAD-CLEAN: models, data, and results (large files — track separately or via DVC)
-models/
+# Anchor to repo root so mad_clean/models/ and mad_clean/data/ source dirs
+# are NOT ignored.
+/models/
 crumb_data/
-results/
+/results/
 
 
 # Real observation data (CASA images, PNGs — use DVC or store separately)
 SNR_G55_10s.MultiScale_spw3.image/
 SNR_G55_10s.briggs.image.png
+
+# Large untracked dataset (G55 PSF cache etc., ~1.7 GB — rsync separately).
+# Anchored to repo root so mad_clean/data/ source dir is NOT ignored.
+/data/

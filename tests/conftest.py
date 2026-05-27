@@ -73,3 +73,32 @@ if "mad_clean" not in sys.modules:
         _mod = sys.modules[f"mad_clean.{_name}"]
         setattr(_train, _name, _mod)
         sys.modules[f"mad_clean.train.{_name}"] = _mod
+
+    # mad_clean.data sub-package
+    _data = types.ModuleType("mad_clean.data")
+    _data.__path__ = [str(ROOT / "mad_clean" / "data")]
+    _data.__package__ = "mad_clean.data"
+    sys.modules["mad_clean.data"] = _data
+    setattr(pkg, "data", _data)
+    for _name, _file in {
+        "psf_bank":        "mad_clean/data/psf_bank.py",
+        "point_sky":       "mad_clean/data/point_sky.py",
+        "extended_sky":    "mad_clean/data/extended_sky.py",
+        "cutout_dataset":  "mad_clean/data/cutout_dataset.py",
+    }.items():
+        _mod = _load_local(f"data.{_name}", _file)
+        setattr(_data, _name, _mod)
+        sys.modules[f"mad_clean.data.{_name}"] = _mod
+
+    # mad_clean.models sub-package
+    _models = types.ModuleType("mad_clean.models")
+    _models.__path__ = [str(ROOT / "mad_clean" / "models")]
+    _models.__package__ = "mad_clean.models"
+    sys.modules["mad_clean.models"] = _models
+    setattr(pkg, "models", _models)
+    for _name, _file in {
+        "mdn_asp": "mad_clean/models/mdn_asp.py",
+    }.items():
+        _mod = _load_local(f"models.{_name}", _file)
+        setattr(_models, _name, _mod)
+        sys.modules[f"mad_clean.models.{_name}"] = _mod
