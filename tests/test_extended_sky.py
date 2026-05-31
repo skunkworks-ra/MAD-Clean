@@ -200,9 +200,12 @@ def test_mixed_field_deterministic():
 
 
 def test_targets_are_target6d():
-    """All returned targets are Target6D named tuples with finite values."""
+    """All returned targets are Target6D named tuples with finite numeric values."""
     _, targets = assemble_mixed_field(size=SIZE, n_sources=20, rng=fresh_rng())
     for t in targets:
         assert isinstance(t, Target6D)
-        for val in t:
+        for field, val in zip(t._fields, t):
+            if field == "kind":
+                assert isinstance(val, str)
+                continue
             assert math.isfinite(val), f"Non-finite value in target: {t}"

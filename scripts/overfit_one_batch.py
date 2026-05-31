@@ -68,8 +68,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--hidden",    type=int,   default=256,
                    help="MLP hidden width (default: 256).")
     p.add_argument("--extended_fraction", type=float, default=0.05,
-                   help="Per-source probability of being extended (default 0.05). "
-                        "Set to 1.0 for an extended-only diagnostic batch.")
+                   help="Per-distractor probability of being extended (default 0.05).")
+    p.add_argument("--morphologies", type=str, default="point,blob",
+                   help="Comma-separated centred-source morphologies to sample from "
+                        "(default: 'point,blob'). Choices: point, blob, shell, filament.")
     return p.parse_args(argv)
 
 
@@ -96,6 +98,10 @@ def run(args: argparse.Namespace) -> dict:
     )
     print(f"[overfit] PSF bank size: {len(psf_bank)}")
 
+    morph_keys = [m.strip() for m in args.morphologies.split(",")]
+    morphology_balance = {m: 1.0 for m in morph_keys}
+    print(f"[overfit] Morphology balance: {morphology_balance}")
+
     dataset = CutoutDataset(
         psf_bank=psf_bank,
         field_size=512,
@@ -105,6 +111,7 @@ def run(args: argparse.Namespace) -> dict:
         extended_fraction=args.extended_fraction,
         rng_seed=args.seed,
         length=args.n_samples,
+        morphology_balance=morphology_balance,
     )
 
     print(f"[overfit] Drawing {args.n_samples} frozen examples ...")
@@ -149,6 +156,8 @@ def run(args: argparse.Namespace) -> dict:
     # 3. Train on the frozen batch
     # ------------------------------------------------------------------
     loss_curve = []
+    best_loss = float("inf")
+    best_state = None
     print(f"[overfit] Training for {args.steps} steps on {args.n_samples} frozen examples ...")
 
     for step in range(1, args.steps + 1):
@@ -162,8 +171,16 @@ def run(args: argparse.Namespace) -> dict:
         loss_val = float(loss.item())
         loss_curve.append(loss_val)
 
+        if loss_val < best_loss:
+            best_loss = loss_val
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
         if step % args.log_every == 0 or step == 1:
             print(f"  step {step:5d}/{args.steps}  loss={loss_val:.4f}")
+
+    # Restore best model state for evaluation
+    model.load_state_dict(best_state)
+    print(f"[overfit] Evaluating at best checkpoint (loss={best_loss:.4f})")
 
     # ------------------------------------------------------------------
     # 4. Per-example errors at mode

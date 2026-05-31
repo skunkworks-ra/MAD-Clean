@@ -45,13 +45,20 @@ SIGMA_MAX_PX: float = 8.0 * BEAM_SIGMA_PX  # ≈ 11.2 px
 
 
 class Target6D(NamedTuple):
-    """Anisotropic-Gaussian Aspen target in native units."""
+    """Anisotropic-Gaussian Aspen target in native units.
+
+    The 6D vector is (x, y, log_flux, log_sig_maj, log_sig_min, pa). ``kind``
+    carries the source morphology label ("point", "blob", "shell", "filament")
+    and is used by CutoutDataset for morphology balance — it is NOT part of
+    the 6D learnable target.
+    """
     x: float          # column centre (px)
     y: float          # row centre (px)
     log_flux: float   # log of integrated flux (Jy)
     log_sig_maj: float  # log of major-axis sigma (px)
     log_sig_min: float  # log of minor-axis sigma (px)
     pa: float           # position angle, radians (E of N, i.e. CCW from +col)
+    kind: str = "point"  # morphology label, not learnable
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +163,7 @@ def render_gaussian_blob(
         log_sig_maj=float(math.log(sig_maj)),
         log_sig_min=float(math.log(sig_min)),
         pa=float(pa),
+        kind="blob",
     )
     return image, target
 
@@ -219,6 +227,7 @@ def render_shell(
         log_sig_maj=float(math.log(radius)),
         log_sig_min=float(math.log(radius)),
         pa=0.0,
+        kind="shell",
     )
     return image, target
 
@@ -306,6 +315,7 @@ def render_filament(
         log_sig_maj=float(math.log(sig_maj)),
         log_sig_min=float(math.log(sig_min)),
         pa=float(pa),
+        kind="filament",
     )
     return image, target
 
@@ -408,6 +418,7 @@ def assemble_mixed_field(
                 log_sig_maj=float(math.log(BEAM_SIGMA_PX)),
                 log_sig_min=float(math.log(BEAM_SIGMA_PX)),
                 pa=0.0,
+                kind="point",
             ))
             if return_per_source:
                 delta = np.zeros((size, size), dtype=np.float32)

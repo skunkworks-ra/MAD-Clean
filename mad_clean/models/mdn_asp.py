@@ -278,6 +278,95 @@ class MDNAsp(nn.Module):
         return out  # (B, n, 6)
 
     # ------------------------------------------------------------------
+    # Set-prediction loss (Hungarian-matched NLL)
+    # ------------------------------------------------------------------
+
+    def set_nll_loss(
+        self,
+        params:      MixParams,
+        targets:     torch.Tensor,  # (B, K_max, 6)
+        target_mask: torch.Tensor,  # (B, K_max) bool
+    ) -> torch.Tensor:
+        """Set-prediction NLL: Hungarian-match K components to N≤K_max true
+        sources per cutout; sum NLL over matched pairs; mean over batch
+        elements that have at least one true source.
+
+        Cutouts with zero true sources contribute nothing — the network is
+        free to put weight anywhere when there's nothing to predict.
+        """
+        from scipy.optimize import linear_sum_assignment  # noqa: PLC0415
+
+        B, K_max, _ = targets.shape
+        logits, mu, log_std = params
+        K = mu.shape[1]
+        if K_max > K:
+            raise ValueError(
+                f"targets pad K_max={K_max} > model K={K}; cannot match"
+            )
+
+        # Encode PA into 7-emitted-dim space, broadcast targets and components
+        pa = targets[:, :, 5]                          # (B, K_max)
+        pa_enc = encode_pa(pa)                         # (B, K_max, 2)
+        y7 = torch.cat([targets[:, :, :5], pa_enc], dim=-1)  # (B, K_max, 7)
+
+        # log_w: log mixture weights (B, K). Not used in matching cost (we
+        # match purely on per-component NLL of the target); used in the
+        # weighted form? Keep matching cost = per-component Gaussian NLL.
+        # (B, K, 1, 7) - (B, 1, K_max, 7)
+        var = torch.exp(2.0 * log_std)                 # (B, K, 7)
+        diff = mu.unsqueeze(2) - y7.unsqueeze(1)       # (B, K, K_max, 7)
+        log_comp = -0.5 * (
+            (diff ** 2) / var.unsqueeze(2)
+            + 2.0 * log_std.unsqueeze(2)
+            + math.log(2.0 * math.pi)
+        ).sum(dim=-1)                                  # (B, K, K_max)
+
+        # cost = -log_comp[k, j], lower = better fit
+        cost = -log_comp
+
+        losses = []
+        cost_np = cost.detach().cpu().numpy()
+        for b in range(B):
+            mask_b = target_mask[b]
+            n_b = int(mask_b.sum().item())
+            if n_b == 0:
+                continue
+            # Submatrix: K rows, n_b columns. Hungarian picks n_b matched pairs.
+            sub = cost_np[b, :, :n_b]                  # (K, n_b)
+            row_ind, col_ind = linear_sum_assignment(sub)
+            # Sum NLL over matched pairs (gradient flows through cost[...] which
+            # is differentiable; the index arrays are constants).
+            row_ind_t = torch.as_tensor(row_ind, dtype=torch.long, device=cost.device)
+            col_ind_t = torch.as_tensor(col_ind, dtype=torch.long, device=cost.device)
+            losses.append(cost[b, row_ind_t, col_ind_t].sum() / n_b)
+
+        if not losses:
+            # Whole batch had no true sources — return a zero with grad path
+            return mu.sum() * 0.0
+
+        return torch.stack(losses).mean()
+
+    # ------------------------------------------------------------------
+    # Inference helper for set prediction
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def all_modes(self, params: MixParams) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-component means decoded to 6D, plus mixture weights.
+
+        Returns
+        -------
+        modes : (B, K, 6) — each component's mean in 6D.
+        weights : (B, K)  — softmax of logits.
+        """
+        logits, mu, _ = params
+        B, K, E = mu.shape
+        flat = mu.reshape(B * K, E)
+        out = self._decode_7d_to_6d(flat).reshape(B, K, 6)
+        weights = F.softmax(logits, dim=-1)
+        return out, weights
+
+    # ------------------------------------------------------------------
     # Internal helper
     # ------------------------------------------------------------------
 
