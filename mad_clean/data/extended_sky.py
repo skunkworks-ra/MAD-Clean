@@ -41,7 +41,7 @@ __all__ = [
 # G55 D-config L-band beam sigma (px).  Used for the lower bound on
 # component scale; upper bound driven by 8 * BEAM_SIGMA_PX.
 BEAM_SIGMA_PX: float = 1.4
-SIGMA_MAX_PX: float = 8.0 * BEAM_SIGMA_PX  # ≈ 11.2 px
+SIGMA_MAX_PX: float = 128.0  # 2x the 128px training patch
 
 
 class Target6D(NamedTuple):
@@ -137,7 +137,7 @@ def render_gaussian_blob(
     if rng is None:
         rng = np.random.default_rng()
 
-    margin = int(math.ceil(SIGMA_MAX_PX * 3))
+    margin = min(int(math.ceil(SIGMA_MAX_PX * 3)), size // 4)
     lo = margin
     hi = size - margin
 
@@ -146,7 +146,7 @@ def render_gaussian_blob(
     if cy is None:
         cy = rng.uniform(lo, hi)
     if sig_maj is None:
-        sig_maj = rng.uniform(BEAM_SIGMA_PX, SIGMA_MAX_PX)
+        sig_maj = rng.uniform(BEAM_SIGMA_PX, min(SIGMA_MAX_PX, (size - 2 * margin) / 2))
     if sig_min is None:
         # Minor axis ≤ major axis
         sig_min = rng.uniform(BEAM_SIGMA_PX, sig_maj)
@@ -196,7 +196,7 @@ def render_shell(
     if rng is None:
         rng = np.random.default_rng()
 
-    margin = int(math.ceil(SIGMA_MAX_PX * 2 + 3))
+    margin = min(int(math.ceil(SIGMA_MAX_PX * 2 + 3)), size // 4)
     lo = margin
     hi = size - margin
 
@@ -205,7 +205,7 @@ def render_shell(
     if cy is None:
         cy = rng.uniform(lo, hi)
     if radius is None:
-        radius = rng.uniform(BEAM_SIGMA_PX, SIGMA_MAX_PX)
+        radius = rng.uniform(BEAM_SIGMA_PX, min(SIGMA_MAX_PX, (size - 2 * margin) / 2))
     if thickness is None:
         # Shell thickness: between 0.5 beam and half the radius
         thickness = rng.uniform(BEAM_SIGMA_PX * 0.5, max(BEAM_SIGMA_PX, radius * 0.5))
@@ -258,7 +258,7 @@ def render_filament(
     if rng is None:
         rng = np.random.default_rng()
 
-    margin = int(math.ceil(SIGMA_MAX_PX * 3))
+    margin = min(int(math.ceil(SIGMA_MAX_PX * 3)), size // 4)
     lo = margin
     hi = size - margin
 
@@ -269,10 +269,10 @@ def render_filament(
     if pa is None:
         pa = rng.uniform(0.0, math.pi)
     if length is None:
-        # Length such that half-length ≤ SIGMA_MAX_PX
-        length = rng.uniform(2 * BEAM_SIGMA_PX, 2 * SIGMA_MAX_PX)
+        max_half_len = min(SIGMA_MAX_PX, (size - 2 * margin) / 2)
+        length = rng.uniform(2 * BEAM_SIGMA_PX, 2 * max_half_len)
     if width is None:
-        width = rng.uniform(BEAM_SIGMA_PX, SIGMA_MAX_PX)
+        width = rng.uniform(BEAM_SIGMA_PX, min(SIGMA_MAX_PX, size // 4))
 
     half_len = length / 2.0
 
