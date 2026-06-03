@@ -39,7 +39,7 @@ import torch
 from casatasks import tclean
 from casatools import image as iatool
 
-from mad_clean.minor_cycle import minor_cycle, render_aspen
+from mad_clean.minor_cycle import minor_cycle, refit_pass, render_aspen
 from mad_clean.models.mdn_asp import MDNAsp
 from mad_clean.data.cutout_dataset import unstandardise_log_flux
 from mad_clean.data.extended_sky import BEAM_SIGMA_PX, SIGMA_MAX_PX
@@ -82,6 +82,8 @@ def parse_args(argv=None):
     p.add_argument("--max_major",        type=int,   default=20)
     p.add_argument("--max_components",   type=int,   default=1000,
                    help="Max minor-cycle components per major cycle.")
+    p.add_argument("--refit",            action="store_true",
+                   help="Run one refit pass after each minor cycle.")
     p.add_argument("--sigma_max_px",     type=float, default=None,
                    help="Override MDN sigma_maj clip ceiling (px). Default: SIGMA_MAX_PX (~11.2px).")
     p.add_argument("--config_idx",       type=int,   default=2,
@@ -350,6 +352,32 @@ def main(argv=None):
         print(f"[img]   model sum after tclean:  {_check2.sum():.6f} Jy")
 
         new_residual = read_casa_image(imgname + ".residual")
+
+        if args.refit and commits:
+            model_img = read_casa_image(imgname + ".model")
+            masked_new_residual = np.where(mask, new_residual, 0.0).astype(np.float32)
+            model_img = refit_pass(
+                commits=commits,
+                post_residual=masked_new_residual,
+                psf=psf,
+                model_update=model_img,
+                model=mdn,
+                device=args.device,
+            )
+            write_casa_image(imgname + ".model", model_img)
+            tclean(
+                vis=args.vis, imagename=imgname,
+                field=args.field, spw=args.spw,
+                specmode=args.specmode, gridder=args.gridder,
+                imsize=[S, S], cell=[args.cell, args.cell],
+                stokes='I', weighting='briggs', robust=args.robust,
+                niter=0, mask=casa_mask,
+                calcpsf=False, calcres=True, restart=True, pbcor=False,
+            )
+            new_residual = read_casa_image(imgname + ".residual")
+            print(f"  [refit] residual_peak after refit: "
+                  f"{float(np.where(mask, new_residual, 0.0).max()):.4e}")
+
         new_peak = float(np.where(mask, new_residual, 0.0).max())
 
         log["major_cycles"].append({

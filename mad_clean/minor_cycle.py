@@ -241,6 +241,105 @@ def minor_cycle(
 
 
 # ---------------------------------------------------------------------------
+# Refit pass
+# ---------------------------------------------------------------------------
+
+def refit_pass(
+    commits:      list[AspenCommit],
+    post_residual: np.ndarray,      # (H, W) residual after the major-cycle tclean
+    psf:          np.ndarray,       # (H, W) float32, peak=1
+    model_update: np.ndarray,       # (H, W) accumulated model from greedy pass
+    model:        MDNAsp,
+    *,
+    device: str | torch.device = "cpu",
+) -> np.ndarray:
+    """One-pass refit of all committed components.
+
+    For each component:
+      1. Reconstruct the leave-one-out residual by adding back this component's
+         PSF footprint to the post-minor-cycle residual.
+      2. Re-run the MDN for shape (sig_maj, sig_min, PA, x_off, y_off) only --
+         no SIGMA_MAX_PX ceiling so larger scales can be recovered.
+      3. Read amplitude directly from the leave-one-out residual peak (signed --
+         negative corrects overshoot from the greedy pass).
+      4. Replace the old component in model_update with the new one.
+
+    Returns the updated model_update, clipped to net non-negative pixelwise.
+    """
+    from mad_clean.data.extended_sky import BEAM_SIGMA_PX
+
+    device = torch.device(device)
+    model.eval()
+    H, W = post_residual.shape
+
+    new_model = model_update.copy()
+
+    for commit in commits:
+        # --- Reconstruct leave-one-out residual ---
+        old_img   = render_aspen(commit.cx, commit.cy, commit.flux,
+                                 commit.sig_maj, commit.sig_min, commit.pa, (H, W))
+        psf_resp  = fftconvolve(old_img, psf, mode="same").astype(np.float32)
+        loo_res   = post_residual + psf_resp          # add back this component
+
+        peak_row  = int(round(commit.cy))
+        peak_col  = int(round(commit.cx))
+        peak_row  = max(0, min(H - 1, peak_row))
+        peak_col  = max(0, min(W - 1, peak_col))
+
+        # Keep greedy flux -- the LOO residual reflects remaining emission, not
+        # this component's individual contribution, so reading amplitude from it
+        # would inflate every component by ~45x.
+        amplitude = commit.flux
+
+        # --- MDN shape pass (no sigma_max clip) ---
+        r0 = peak_row - _HALF;  r1 = r0 + _CUTOUT
+        c0 = peak_col - _HALF;  c1 = c0 + _CUTOUT
+        res_cut = _safe_crop(loo_res, r0, r1, c0, c1)
+        psf_cut = _crop_psf_centred(psf, _CUTOUT)
+
+        sigma_local = float(1.4826 * np.median(np.abs(res_cut)))
+        if not np.isfinite(sigma_local) or sigma_local <= 0:
+            sigma_local = float(np.abs(loo_res).mean()) or 1e-6
+
+        sig_t = torch.tensor([sigma_local], dtype=torch.float32)
+        cfg_t = torch.tensor([0],           dtype=torch.long)   # config unused for shape
+        cond  = make_cond(sig_t, cfg_t).to(device)
+
+        img_t = torch.from_numpy(
+            np.stack([res_cut, psf_cut], axis=0)[None]
+        ).to(device)
+
+        with torch.no_grad():
+            params = model(img_t, cond)
+
+        mode6d  = model.mode(params).squeeze(0).cpu().numpy()
+        x_off   = float(mode6d[0])
+        y_off   = float(mode6d[1])
+        # No SIGMA_MAX_PX ceiling -- LOO residual gives cleaner view of true extent.
+        sig_maj = float(np.clip(np.exp(mode6d[3]), BEAM_SIGMA_PX, _HALF))
+        sig_min = float(np.clip(np.exp(mode6d[4]), BEAM_SIGMA_PX, sig_maj))
+        pa      = float(mode6d[5])
+
+        cx_new = float(peak_col) + x_off
+        cy_new = float(peak_row) + y_off
+
+        # --- Swap old component for new in model ---
+        new_img = render_aspen(cx_new, cy_new, amplitude,
+                               sig_maj, sig_min, pa, (H, W))
+        new_model -= old_img
+        new_model += new_img
+
+    # Net positivity: individual components can be negative but the model cannot
+    new_model = np.clip(new_model, 0.0, None)
+
+    n_neg = int((new_model == 0).sum() - (model_update == 0).sum())
+    print(f"  [refit] {len(commits)} components refit  "
+          f"pixels zeroed by net-positivity clip: {max(n_neg, 0)}")
+
+    return new_model
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers (mirrors cutout_dataset.py)
 # ---------------------------------------------------------------------------
 
