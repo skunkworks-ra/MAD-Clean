@@ -41,17 +41,20 @@ def _xy_grids_batch(size: int, B: int, device: torch.device):
 # ---------------------------------------------------------------------------
 
 def fft_convolve_batch(
-    images:  torch.Tensor,
-    psf:     torch.Tensor,
+    images:    torch.Tensor,
+    psf:       torch.Tensor | None = None,
     psf_shift: tuple[int, int] | None = None,
+    psf_fft:   torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Convolve (B, H, W) images with a single (H, W) PSF. Returns (B, H, W).
 
-    psf_shift : (py, px) of PSF peak -- precompute once and pass in to avoid
-                repeated nonzero() calls.
+    Fast path: pass psf_fft = rfft2(roll(psf, shift)) precomputed once per PSF.
+    Then no rfft2(psf) and no roll on the (B, H, W) output.
     """
     B, H, W = images.shape
-    fi  = torch.fft.rfft2(images, s=(H, W))
+    fi = torch.fft.rfft2(images, s=(H, W))
+    if psf_fft is not None:
+        return torch.fft.irfft2(fi * psf_fft, s=(H, W))
     fp  = torch.fft.rfft2(psf.unsqueeze(0), s=(H, W))
     out = torch.fft.irfft2(fi * fp, s=(H, W))
     if psf_shift is None:

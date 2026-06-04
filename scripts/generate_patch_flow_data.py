@@ -64,11 +64,17 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 def _rand(shape, lo, hi, device):
+    if isinstance(shape, int):
+        shape = (shape,)
     return torch.empty(shape, device=device).uniform_(lo, hi)
 
 
 def prepare_psf(psf_np: np.ndarray, device: torch.device):
-    """Load PSF to GPU once, return (psf_full, psf_cut, beam_area, psf_shift)."""
+    """Load PSF to GPU, return (psf_full, psf_cut, beam_area, psf_shift, psf_fft).
+
+    psf_fft has the shift baked in via roll-before-FFT so callers need neither
+    rfft2(psf) nor torch.roll on the (B,H,W) output.
+    """
     psf_full = torch.from_numpy(psf_np).float().to(device)
     py, px = (psf_full == psf_full.max()).nonzero(as_tuple=False)[0]
     py, px = int(py), int(px)
@@ -77,7 +83,10 @@ def prepare_psf(psf_np: np.ndarray, device: torch.device):
     pc0, pc1 = px - HALF, px - HALF + CUTOUT_SIZE
     psf_cut   = _safe_crop_t(psf_full, pr0, pr1, pc0, pc1, device)
     beam_area = float(psf_cut.sum())
-    return psf_full, psf_cut, beam_area, psf_shift
+    H, W = psf_full.shape
+    psf_rolled = torch.roll(psf_full, shifts=psf_shift, dims=(0, 1))
+    psf_fft = torch.fft.rfft2(psf_rolled.unsqueeze(0), s=(H, W))
+    return psf_full, psf_cut, beam_area, psf_shift, psf_fft
 
 
 def generate_batch(
@@ -88,6 +97,7 @@ def generate_batch(
     psf_shift: tuple[int, int],
     device:    torch.device,
     rng:       torch.Generator,
+    psf_fft:   torch.Tensor | None = None,  # precomputed rfft2(roll(psf))
 ) -> dict[str, torch.Tensor]:
     """Generate B (dirty, clean, psf, sigma) samples. Returns CPU tensors."""
     H = W = FIELD_SIZE
@@ -148,21 +158,20 @@ def generate_batch(
             H, cx[fi_mask], cy[fi_mask], flux[fi_mask],
             length, width, pa, device)
 
-    # --- Distractor scene (random point sources, fully vectorised) ---
-    n_dist = int(torch.randint(5, 31, (1,), device=device, generator=rng))
+    # --- Distractor scene: fully vectorised, no Python loop ---
+    N_DIST = 20
+    dr   = torch.randint(16, H - 16, (N_DIST, B), device=device, generator=rng)
+    dc   = torch.randint(16, W - 16, (N_DIST, B), device=device, generator=rng)
+    df   = _rand((N_DIST, B), 1e-4, 1e-1, device)
+    flat = (dr * W + dc).T.contiguous()                       # (B, N_DIST)
     distractors = torch.zeros(B, H * W, device=device)
-    for _ in range(n_dist):
-        dr   = torch.randint(16, H - 16, (B,), device=device, generator=rng)
-        dc   = torch.randint(16, W - 16, (B,), device=device, generator=rng)
-        df   = _rand(B, 1e-4, 1e-1, device)
-        flat = dr * W + dc                                    # (B,)
-        distractors.scatter_add_(1, flat.unsqueeze(1), df.unsqueeze(1))
+    distractors.scatter_add_(1, flat, df.T.contiguous())
     distractors = distractors.view(B, H, W)
 
     sky = distractors + centred   # (B, H, W)
 
     # --- SNR floor per sample ---
-    dirty_centred = fft_convolve_batch(centred, psf_full, psf_shift)  # (B, H, W)
+    dirty_centred = fft_convolve_batch(centred, psf_fft=psf_fft)   # (B, H, W)
     conv_peak = dirty_centred.abs().amax(dim=(1, 2))               # (B,)
     snr_thresh = SNR_MIN * SIGMA_NOISE
     scale = (snr_thresh / conv_peak.clamp(min=1e-30)).clamp(min=1.0)
@@ -171,7 +180,7 @@ def generate_batch(
     sky = distractors + centred
 
     # --- Dirty image ---
-    dirty_full = fft_convolve_batch(sky, psf_full, psf_shift)      # (B, H, W)
+    dirty_full = fft_convolve_batch(sky, psf_fft=psf_fft)          # (B, H, W)
     noise = torch.randn(B, H, W, device=device) * SIGMA_NOISE
     dirty_full = dirty_full + noise
 
@@ -247,20 +256,27 @@ def main():
     torch.zeros(1, device=device)
     print(f"CUDA ready: {torch.cuda.get_device_name(device)}", flush=True)
 
+    # Preload all PSFs to GPU with FFTs precomputed (shift baked in)
+    print(f"Preloading {len(psf_bank)} PSFs to GPU ...", flush=True)
+    psf_entries = [prepare_psf(psf_bank[idx][0], device) for idx in range(len(psf_bank))]
+    print(f"  {len(psf_entries)} PSFs ready.", flush=True)
+
     generated = 0
     shard_idx = 0
     shard_dirty, shard_clean, shard_psf, shard_sigma = [], [], [], []
 
     t0 = time.time()
     for i in range(n_batches):
-        psf_np, _ = psf_bank.sample(rng_np)
-        psf_full, psf_cut, beam_area, psf_shift = prepare_psf(psf_np, device)
-        batch = generate_batch(B, psf_full, psf_cut, beam_area, psf_shift, device, rng)
+        psf_full, psf_cut, beam_area, psf_shift, psf_fft = \
+            psf_entries[int(rng_np.integers(len(psf_entries)))]
+        if i < 3 or i % 50 == 0:
+            print(f"  batch {i+1}/{n_batches} starting ...", flush=True)
+        batch = generate_batch(B, psf_full, psf_cut, beam_area, psf_shift, device, rng, psf_fft)
         if i < 3 or i % 50 == 0:
             elapsed = time.time() - t0
             rate = (i + 1) * B / max(elapsed, 1e-6)
             eta = (n_batches - i - 1) / max(rate / B, 1e-6)
-            print(f"  batch {i+1}/{n_batches}  samples={generated + B}  "
+            print(f"  batch {i+1}/{n_batches} done  samples={generated + B}  "
                   f"rate={rate:.0f}/s  eta={eta/60:.1f}min", flush=True)
 
         shard_dirty.append(batch["dirty"])
