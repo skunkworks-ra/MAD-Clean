@@ -22,6 +22,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from mad_clean.data.patch_flow_dataset import PatchFlowDataset
+from mad_clean.data.patch_flow_dataset_torch import PatchFlowDatasetTorch
 from mad_clean.data.psf_bank import load_g55_psf_bank
 from mad_clean.models.patch_flow import PatchFlow, cfm_loss
 
@@ -42,6 +43,8 @@ def parse_args():
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--resume",        type=str,   default=None,
                    help="Path to checkpoint to resume from.")
+    p.add_argument("--torch_dataset", action="store_true",
+                   help="Use GPU-side PatchFlowDatasetTorch (num_workers=0).")
     return p.parse_args()
 
 
@@ -55,25 +58,38 @@ def main():
 
     psf_bank = load_g55_psf_bank(_REPO_ROOT)
 
-    train_ds = PatchFlowDataset(
-        psf_bank=psf_bank,
-        length=args.samples_per_epoch,
-        rng_seed=args.seed,
-    )
-    val_ds = PatchFlowDataset(
-        psf_bank=psf_bank,
-        length=args.val_samples,
-        rng_seed=args.seed + 10_000_000,  # held-out split
-    )
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.n_workers, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.n_workers, pin_memory=True,
-    )
+    if args.torch_dataset:
+        train_ds = PatchFlowDatasetTorch(
+            psf_bank=psf_bank, device=device,
+            length=args.samples_per_epoch, rng_seed=args.seed,
+        )
+        val_ds = PatchFlowDatasetTorch(
+            psf_bank=psf_bank, device=device,
+            length=args.val_samples, rng_seed=args.seed + 10_000_000,
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                  shuffle=True, num_workers=0)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+                                  shuffle=False, num_workers=0)
+    else:
+        train_ds = PatchFlowDataset(
+            psf_bank=psf_bank,
+            length=args.samples_per_epoch,
+            rng_seed=args.seed,
+        )
+        val_ds = PatchFlowDataset(
+            psf_bank=psf_bank,
+            length=args.val_samples,
+            rng_seed=args.seed + 10_000_000,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.n_workers, pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.n_workers, pin_memory=True,
+        )
 
     model = PatchFlow(base_channels=args.base_channels, depth=args.depth).to(device)
     opt   = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
