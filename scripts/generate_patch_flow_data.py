@@ -102,20 +102,20 @@ def generate_batch(
     # Point sources (morph_idx == 0)
     pt_mask = morph_idx == 0
     if pt_mask.any():
-        rows = cy[pt_mask].round().long().clamp(0, H - 1)
-        cols = cx[pt_mask].round().long().clamp(0, W - 1)
-        pt_imgs = torch.zeros(pt_mask.sum(), H, W, device=device)
-        for i, (r, c, f) in enumerate(zip(rows, cols, flux[pt_mask])):
-            pt_imgs[i, r, c] = f
-        centred[pt_mask] = pt_imgs
+        n_pt  = int(pt_mask.sum())
+        rows  = cy[pt_mask].round().long().clamp(0, H - 1)
+        cols  = cx[pt_mask].round().long().clamp(0, W - 1)
+        flat  = rows * W + cols                               # (n_pt,)
+        pt_imgs = torch.zeros(n_pt, H * W, device=device)
+        pt_imgs.scatter_(1, flat.unsqueeze(1), flux[pt_mask].unsqueeze(1))
+        centred[pt_mask] = pt_imgs.view(n_pt, H, W)
 
     # Blobs (morph_idx == 1)
     bl_mask = morph_idx == 1
     if bl_mask.any():
         n = int(bl_mask.sum())
         sig_maj = _rand(n, BEAM_SIGMA_PX, SIGMA_MAX_PX, device)
-        sig_min = torch.stack([_rand(1, BEAM_SIGMA_PX, float(s), device)[0]
-                               for s in sig_maj])
+        sig_min = _rand(n, BEAM_SIGMA_PX, SIGMA_MAX_PX, device).clamp(max=sig_maj)
         pa = _rand(n, 0.0, math.pi, device)
         centred[bl_mask] = render_gaussian_blob_batch(
             H, cx[bl_mask], cy[bl_mask], flux[bl_mask],
@@ -126,9 +126,8 @@ def generate_batch(
     if sh_mask.any():
         n = int(sh_mask.sum())
         radius    = _rand(n, BEAM_SIGMA_PX, SIGMA_MAX_PX, device)
-        thickness = torch.stack([
-            _rand(1, BEAM_SIGMA_PX * 0.5, max(BEAM_SIGMA_PX, float(r) * 0.5), device)[0]
-            for r in radius])
+        thickness = _rand(n, BEAM_SIGMA_PX * 0.5, BEAM_SIGMA_PX, device) + \
+                    _rand(n, 0.0, 1.0, device) * (radius * 0.5).clamp(min=0.0)
         centred[sh_mask] = render_shell_batch(
             H, cx[sh_mask], cy[sh_mask], flux[sh_mask],
             radius, thickness, device)
@@ -144,15 +143,16 @@ def generate_batch(
             H, cx[fi_mask], cy[fi_mask], flux[fi_mask],
             length, width, pa, device)
 
-    # --- Distractor scene (simple: random point sources) ---
+    # --- Distractor scene (random point sources, fully vectorised) ---
     n_dist = int(torch.randint(5, 31, (1,), device=device, generator=rng))
-    distractors = torch.zeros(B, H, W, device=device)
+    distractors = torch.zeros(B, H * W, device=device)
     for _ in range(n_dist):
-        dr = torch.randint(16, H - 16, (B,), device=device, generator=rng)
-        dc = torch.randint(16, W - 16, (B,), device=device, generator=rng)
-        df = _rand(B, 1e-4, 1e-1, device)
-        for b in range(B):
-            distractors[b, dr[b], dc[b]] += df[b]
+        dr   = torch.randint(16, H - 16, (B,), device=device, generator=rng)
+        dc   = torch.randint(16, W - 16, (B,), device=device, generator=rng)
+        df   = _rand(B, 1e-4, 1e-1, device)
+        flat = dr * W + dc                                    # (B,)
+        distractors.scatter_add_(1, flat.unsqueeze(1), df.unsqueeze(1))
+    distractors = distractors.view(B, H, W)
 
     sky = distractors + centred   # (B, H, W)
 
@@ -170,17 +170,22 @@ def generate_batch(
     noise = torch.randn(B, H, W, device=device) * SIGMA_NOISE
     dirty_full = dirty_full + noise
 
-    # --- Crop cutouts ---
-    cr = cy.round().long().clamp(HALF, H - HALF - 1)
-    cc = cx.round().long().clamp(HALF, W - HALF - 1)
+    # --- Crop cutouts (vectorised) ---
+    cr = cy.round().long().clamp(HALF, H - HALF - 1)  # (B,)
+    cc = cx.round().long().clamp(HALF, W - HALF - 1)  # (B,)
 
-    dirty_cuts = torch.zeros(B, S, S, device=device)
-    clean_cuts = torch.zeros(B, S, S, device=device)
-    for b in range(B):
-        r0, r1 = int(cr[b]) - HALF, int(cr[b]) - HALF + S
-        c0, c1 = int(cc[b]) - HALF, int(cc[b]) - HALF + S
-        dirty_cuts[b] = dirty_full[b, r0:r1, c0:c1]
-        clean_cuts[b] = centred[b,  r0:r1, c0:c1]
+    # Build row/col index grids for all samples at once
+    offsets = torch.arange(S, device=device) - HALF          # (S,)
+    row_idx = (cr[:, None] + offsets[None, :]).clamp(0, H-1) # (B, S)
+    col_idx = (cc[:, None] + offsets[None, :]).clamp(0, W-1) # (B, S)
+
+    # Expand to (B, S, S) for gather
+    ri = row_idx[:, :, None].expand(B, S, S)                 # (B, S, S)
+    ci = col_idx[:, None, :].expand(B, S, S)                 # (B, S, S)
+    flat_idx = ri * W + ci                                    # (B, S, S)
+
+    dirty_cuts = dirty_full.flatten(1).gather(1, flat_idx.flatten(1)).view(B, S, S)
+    clean_cuts = centred.flatten(1).gather(1, flat_idx.flatten(1)).view(B, S, S)
 
     # --- Beam area + peak normalisation ---
     if beam_area > 0:
