@@ -107,6 +107,7 @@ def minor_cycle(
     *,
     loop_gain:   float = 0.1,
     n_sigma_stop: float = 3.0,
+    abs_noise_floor: float | None = None,  # absolute floor (Jy/beam); overrides n_sigma_stop*sigma when set
     sidelobe_level: float = 0.2,
     divergence_tol: float = 0.05,
     max_components: int = 1000,
@@ -131,7 +132,7 @@ def minor_cycle(
     model_update = np.zeros((H, W), dtype=np.float32)
     commits: list[AspenCommit] = []
 
-    noise_floor  = n_sigma_stop * sigma
+    noise_floor  = abs_noise_floor if abs_noise_floor is not None else n_sigma_stop * sigma
     dirty_peak   = float(np.abs(residual).max())
     sidelobe_floor = sidelobe_level * dirty_peak
     prev_peak    = dirty_peak

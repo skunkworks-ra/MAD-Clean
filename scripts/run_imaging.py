@@ -67,7 +67,9 @@ def parse_args(argv=None):
     p.add_argument("--cell",      default="2.5arcsec")
     p.add_argument("--field",     default="",    help="tclean field selection. Empty string = all fields; pass e.g. '2~8' or '3C391*' to restrict to science targets.")
     p.add_argument("--spw",       default="",    help="tclean spw selection.")
-    p.add_argument("--gridder",   default="mosaic")
+    p.add_argument("--gridder",      default="mosaic")
+    p.add_argument("--wprojplanes",  type=int, default=-1,
+                   help="Number of w-projection planes. -1 = auto (tclean default). Only used when --gridder=wproject.")
     p.add_argument("--specmode",  default="mfs")
     p.add_argument("--robust",    type=float, default=0.5)
 
@@ -260,6 +262,7 @@ def main(argv=None):
         vis=args.vis, imagename=imgname,
         field=args.field, spw=args.spw,
         specmode=args.specmode, gridder=args.gridder,
+        wprojplanes=args.wprojplanes,
         imsize=[S, S], cell=[args.cell, args.cell],
         stokes='I', weighting='briggs', robust=args.robust,
         niter=0, mask=casa_mask,
@@ -319,6 +322,7 @@ def main(argv=None):
             residual=masked_residual, psf=psf,
             sigma=sigma_rms, config_idx=args.config_idx, model=mdn,
             loop_gain=args.loop_gain, sidelobe_level=sidelobe_level,
+            abs_noise_floor=threshold,
             divergence_tol=args.divergence_tol, image_mask=mask,
             sigma_max_px=args.sigma_max_px,
             max_components=args.max_components,
@@ -347,6 +351,7 @@ def main(argv=None):
             vis=args.vis, imagename=imgname,
             field=args.field, spw=args.spw,
             specmode=args.specmode, gridder=args.gridder,
+        wprojplanes=args.wprojplanes,
             imsize=[S, S], cell=[args.cell, args.cell],
             stokes='I', weighting='briggs', robust=args.robust,
             niter=0, mask=casa_mask,
@@ -374,6 +379,7 @@ def main(argv=None):
                 vis=args.vis, imagename=imgname,
                 field=args.field, spw=args.spw,
                 specmode=args.specmode, gridder=args.gridder,
+        wprojplanes=args.wprojplanes,
                 imsize=[S, S], cell=[args.cell, args.cell],
                 stokes='I', weighting='briggs', robust=args.robust,
                 niter=0, mask=casa_mask,
