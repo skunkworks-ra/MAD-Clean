@@ -203,11 +203,13 @@ def build_uncertainty_image(all_commits: list, shape: tuple[int, int],
         # Decode flux dimension (index 2 is log_flux_std)
         log_flux_std_samples = samples[:, 2].numpy()
         log_flux_vals = np.array([unstandardise_log_flux(float(z)) for z in log_flux_std_samples])
-        log_flux_vals = np.clip(log_flux_vals, -20.0, 20.0)   # guard exp overflow in float32
+        # Clip to training flux range [1e-4, 1e-1] Jy with generous margin
+        log_flux_vals = np.clip(log_flux_vals, np.log(1e-6), np.log(1.0))
         flux_samples = np.exp(log_flux_vals)
-        flux_samples = np.clip(flux_samples, 0.0, None)
 
-        flux_std = float(flux_samples.std())
+        # Robust IQR-based std -- immune to posterior tail outliers
+        p16, p84 = np.percentile(flux_samples, [16.0, 84.0])
+        flux_std = float((p84 - p16) / 2.0)
         if flux_std <= 0 or not np.isfinite(flux_std):
             continue
 
@@ -299,10 +301,13 @@ def main(argv=None):
     # --- major cycle loop ---
     for major in range(args.max_major):
         residual = read_casa_image(imgname + ".residual")
+        # Re-estimate noise from the current residual so the minor-cycle floor
+        # tracks the true noise level as cleaning progresses.
+        sigma_rms = measure_noise_rms(residual, mask)
         res_peak = float(np.where(mask, residual, 0.0).max())
         threshold = max(res_peak * sidelobe_level, noise_floor)
         print(f"\n[img] Major cycle {major}  residual_peak={res_peak:.4e}  "
-              f"threshold={threshold:.4e}  "
+              f"sigma_rms={sigma_rms:.4e}  threshold={threshold:.4e}  "
               f"(psf_floor={res_peak*sidelobe_level:.4e}  noise_floor={noise_floor:.4e})")
 
         if res_peak < threshold:
