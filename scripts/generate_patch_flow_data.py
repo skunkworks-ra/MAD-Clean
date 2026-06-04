@@ -67,26 +67,31 @@ def _rand(shape, lo, hi, device):
     return torch.empty(shape, device=device).uniform_(lo, hi)
 
 
+def prepare_psf(psf_np: np.ndarray, device: torch.device):
+    """Load PSF to GPU once, return (psf_full, psf_cut, beam_area, psf_shift)."""
+    psf_full = torch.from_numpy(psf_np).float().to(device)
+    py, px = (psf_full == psf_full.max()).nonzero(as_tuple=False)[0]
+    py, px = int(py), int(px)
+    psf_shift = (-py, -px)
+    pr0, pr1 = py - HALF, py - HALF + CUTOUT_SIZE
+    pc0, pc1 = px - HALF, px - HALF + CUTOUT_SIZE
+    psf_cut   = _safe_crop_t(psf_full, pr0, pr1, pc0, pc1, device)
+    beam_area = float(psf_cut.sum())
+    return psf_full, psf_cut, beam_area, psf_shift
+
+
 def generate_batch(
-    B:       int,
-    psf_np:  np.ndarray,
-    device:  torch.device,
-    rng:     torch.Generator,
+    B:         int,
+    psf_full:  torch.Tensor,        # (H_psf, W_psf) already on device
+    psf_cut:   torch.Tensor,        # (S, S) already on device
+    beam_area: float,
+    psf_shift: tuple[int, int],
+    device:    torch.device,
+    rng:       torch.Generator,
 ) -> dict[str, torch.Tensor]:
     """Generate B (dirty, clean, psf, sigma) samples. Returns CPU tensors."""
     H = W = FIELD_SIZE
     S = CUTOUT_SIZE
-
-    psf_full = torch.from_numpy(psf_np).float().to(device)   # (H_psf, W_psf)
-    Hp, Wp   = psf_full.shape
-
-    # PSF cutout (same for all samples in batch -- same PSF)
-    py, px = (psf_full == psf_full.max()).nonzero(as_tuple=False)[0]
-    py, px = int(py), int(px)
-    pr0, pr1 = py - HALF, py - HALF + S
-    pc0, pc1 = px - HALF, px - HALF + S
-    psf_cut = _safe_crop_t(psf_full, pr0, pr1, pc0, pc1, device)  # (S, S)
-    beam_area = float(psf_cut.sum())
 
     # --- Centred source parameters (B,) ---
     morph_idx = torch.randint(0, 4, (B,), device=device, generator=rng)
@@ -157,7 +162,7 @@ def generate_batch(
     sky = distractors + centred   # (B, H, W)
 
     # --- SNR floor per sample ---
-    dirty_centred = fft_convolve_batch(centred, psf_full)          # (B, H, W)
+    dirty_centred = fft_convolve_batch(centred, psf_full, psf_shift)  # (B, H, W)
     conv_peak = dirty_centred.abs().amax(dim=(1, 2))               # (B,)
     snr_thresh = SNR_MIN * SIGMA_NOISE
     scale = (snr_thresh / conv_peak.clamp(min=1e-30)).clamp(min=1.0)
@@ -166,7 +171,7 @@ def generate_batch(
     sky = distractors + centred
 
     # --- Dirty image ---
-    dirty_full = fft_convolve_batch(sky, psf_full)                 # (B, H, W)
+    dirty_full = fft_convolve_batch(sky, psf_full, psf_shift)      # (B, H, W)
     noise = torch.randn(B, H, W, device=device) * SIGMA_NOISE
     dirty_full = dirty_full + noise
 
@@ -199,10 +204,10 @@ def generate_batch(
     sigma = dirty_cuts.flatten(1).abs().median(dim=1).values * 1.4826  # (B,)
 
     return {
-        "dirty": dirty_cuts.unsqueeze(1).cpu(),   # (B, 1, S, S)
-        "clean": clean_cuts.unsqueeze(1).cpu(),   # (B, 1, S, S)
-        "psf":   psf_cut.unsqueeze(0).expand(B, -1, -1).unsqueeze(1).cpu(),  # (B, 1, S, S)
-        "sigma": sigma.cpu(),                     # (B,)
+        "dirty": dirty_cuts.unsqueeze(1),                          # (B, 1, S, S) on device
+        "clean": clean_cuts.unsqueeze(1),                          # (B, 1, S, S) on device
+        "psf":   psf_cut.unsqueeze(0).expand(B, -1, -1).unsqueeze(1).contiguous(),  # (B, 1, S, S)
+        "sigma": sigma,                                            # (B,) on device
     }
 
 
@@ -246,7 +251,8 @@ def main():
     t0 = time.time()
     for i in range(n_batches):
         psf_np, _ = psf_bank.sample(rng_np)
-        batch = generate_batch(B, psf_np, device, rng)
+        psf_full, psf_cut, beam_area, psf_shift = prepare_psf(psf_np, device)
+        batch = generate_batch(B, psf_full, psf_cut, beam_area, psf_shift, device, rng)
 
         shard_dirty.append(batch["dirty"])
         shard_clean.append(batch["clean"])
@@ -254,13 +260,13 @@ def main():
         shard_sigma.append(batch["sigma"])
         generated += B
 
-        # Save shard every 10k samples
+        # Save shard every 10k samples -- single CPU transfer here
         if generated % 10_000 == 0 or i == n_batches - 1:
             shard = {
-                "dirty": torch.cat(shard_dirty),
-                "clean": torch.cat(shard_clean),
-                "psf":   torch.cat(shard_psf),
-                "sigma": torch.cat(shard_sigma),
+                "dirty": torch.cat(shard_dirty).cpu(),
+                "clean": torch.cat(shard_clean).cpu(),
+                "psf":   torch.cat(shard_psf).cpu(),
+                "sigma": torch.cat(shard_sigma).cpu(),
             }
             path = out_dir / f"shard_{shard_idx:04d}.pt"
             torch.save(shard, path)

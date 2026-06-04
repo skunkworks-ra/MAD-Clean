@@ -40,17 +40,24 @@ def _xy_grids_batch(size: int, B: int, device: torch.device):
 # Batched FFT convolution
 # ---------------------------------------------------------------------------
 
-def fft_convolve_batch(images: torch.Tensor, psf: torch.Tensor) -> torch.Tensor:
+def fft_convolve_batch(
+    images:  torch.Tensor,
+    psf:     torch.Tensor,
+    psf_shift: tuple[int, int] | None = None,
+) -> torch.Tensor:
     """Convolve (B, H, W) images with a single (H, W) PSF. Returns (B, H, W).
 
-    Uses same-mode circular convolution via rfft2. PSF is assumed peak-centred.
+    psf_shift : (py, px) of PSF peak -- precompute once and pass in to avoid
+                repeated nonzero() calls.
     """
     B, H, W = images.shape
-    fi  = torch.fft.rfft2(images, s=(H, W))          # (B, H, W//2+1)
-    fp  = torch.fft.rfft2(psf.unsqueeze(0), s=(H, W))  # (1, H, W//2+1)
-    out = torch.fft.irfft2(fi * fp, s=(H, W))        # (B, H, W)
-    py, px = (psf == psf.max()).nonzero(as_tuple=False)[0]
-    out = torch.roll(out, shifts=(-int(py), -int(px)), dims=(1, 2))
+    fi  = torch.fft.rfft2(images, s=(H, W))
+    fp  = torch.fft.rfft2(psf.unsqueeze(0), s=(H, W))
+    out = torch.fft.irfft2(fi * fp, s=(H, W))
+    if psf_shift is None:
+        py, px = (psf == psf.max()).nonzero(as_tuple=False)[0]
+        psf_shift = (-int(py), -int(px))
+    out = torch.roll(out, shifts=psf_shift, dims=(1, 2))
     return out
 
 
