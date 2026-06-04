@@ -263,7 +263,6 @@ def main():
 
     generated = 0
     shard_idx = 0
-    shard_dirty, shard_clean, shard_psf, shard_sigma = [], [], [], []
 
     t0 = time.time()
     for i in range(n_batches):
@@ -279,30 +278,20 @@ def main():
             print(f"  batch {i+1}/{n_batches} done  samples={generated + B}  "
                   f"rate={rate:.0f}/s  eta={eta/60:.1f}min", flush=True)
 
-        shard_dirty.append(batch["dirty"].cpu())
-        shard_clean.append(batch["clean"].cpu())
-        shard_psf.append(batch["psf"].cpu())
-        shard_sigma.append(batch["sigma"].cpu())
+        # Save each batch directly -- no in-memory accumulation
+        shard = {
+            "dirty": batch["dirty"].cpu(),
+            "clean": batch["clean"].cpu(),
+            "psf":   batch["psf"].cpu(),
+            "sigma": batch["sigma"].cpu(),
+        }
+        path = out_dir / f"shard_{shard_idx:04d}.pt"
+        torch.save(shard, path)
+        shard_idx += 1
         generated += B
 
-        # Save shard every 10k samples -- single CPU transfer here
-        if generated % 10_000 == 0 or i == n_batches - 1:
-            shard = {
-                "dirty": torch.cat(shard_dirty).cpu(),
-                "clean": torch.cat(shard_clean).cpu(),
-                "psf":   torch.cat(shard_psf).cpu(),
-                "sigma": torch.cat(shard_sigma).cpu(),
-            }
-            path = out_dir / f"shard_{shard_idx:04d}.pt"
-            torch.save(shard, path)
-            elapsed = time.time() - t0
-            rate = generated / elapsed
-            print(f"  shard {shard_idx:04d}  samples={generated}  "
-                  f"rate={rate:.0f}/s  -> {path}")
-            shard_dirty, shard_clean, shard_psf, shard_sigma = [], [], [], []
-            shard_idx += 1
-
-    print(f"Done. {generated} samples in {len(list(out_dir.glob('shard_*.pt')))} shards.")
+    elapsed = time.time() - t0
+    print(f"Done. {generated} samples in {shard_idx} shards ({elapsed/60:.1f}min).")
 
 
 if __name__ == "__main__":
