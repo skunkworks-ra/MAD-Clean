@@ -279,10 +279,10 @@ def main():
             print(f"  batch {i+1}/{n_batches} done  samples={generated + B}  "
                   f"rate={rate:.0f}/s  eta={eta/60:.1f}min", flush=True)
 
-        shard_dirty.append(batch["dirty"])
-        shard_clean.append(batch["clean"])
-        shard_psf.append(batch["psf"])
-        shard_sigma.append(batch["sigma"])
+        shard_dirty.append(batch["dirty"].cpu())
+        shard_clean.append(batch["clean"].cpu())
+        shard_psf.append(batch["psf"].cpu())
+        shard_sigma.append(batch["sigma"].cpu())
         generated += B
 
         # Save shard every 10k samples -- single CPU transfer here
