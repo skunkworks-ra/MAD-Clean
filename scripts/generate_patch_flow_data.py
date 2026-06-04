@@ -243,6 +243,9 @@ def main():
     n_batches = math.ceil(n_total / B)
 
     print(f"Generating {n_total} samples in {n_batches} batches of {B} on {device}")
+    print("Warming up CUDA ...", flush=True)
+    torch.zeros(1, device=device)
+    print(f"CUDA ready: {torch.cuda.get_device_name(device)}", flush=True)
 
     generated = 0
     shard_idx = 0
@@ -253,6 +256,12 @@ def main():
         psf_np, _ = psf_bank.sample(rng_np)
         psf_full, psf_cut, beam_area, psf_shift = prepare_psf(psf_np, device)
         batch = generate_batch(B, psf_full, psf_cut, beam_area, psf_shift, device, rng)
+        if i < 3 or i % 50 == 0:
+            elapsed = time.time() - t0
+            rate = (i + 1) * B / max(elapsed, 1e-6)
+            eta = (n_batches - i - 1) / max(rate / B, 1e-6)
+            print(f"  batch {i+1}/{n_batches}  samples={generated + B}  "
+                  f"rate={rate:.0f}/s  eta={eta/60:.1f}min", flush=True)
 
         shard_dirty.append(batch["dirty"])
         shard_clean.append(batch["clean"])
