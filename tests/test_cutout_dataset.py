@@ -277,3 +277,36 @@ def test_return_sky_cutout(psf_bank):
     centre = CUTOUT // 2
     core = sky[centre - 16: centre + 16, centre - 16: centre + 16]
     assert float(core.sum()) > 0.0
+
+
+def test_compact_subtracted_excludes_points(psf_bank):
+    """Hybrid contract: with compact_subtracted=True no point-source flux
+    appears in either the sky cutout or the residual."""
+    # Force many distractors, none extended -> plain mode sky is all deltas
+    kwargs = dict(
+        psf_bank=psf_bank, field_size=FIELD, cutout_size=CUTOUT,
+        sigma_noise=1e-12, n_sources_per_field=(20, 30),
+        extended_fraction=0.0, rng_seed=7, length=3, return_sky=True,
+        morphology_balance={"blob": 1.0},
+    )
+    ds_hybrid = CutoutDataset(compact_subtracted=True, **kwargs)
+    residual, _, _, _, sky = ds_hybrid[0]
+    # Sky contains only the centred blob: smooth, no isolated single-pixel
+    # deltas. A delta has all its flux in one pixel; a blob (sigma >= beam)
+    # has peak/flux < 0.1.
+    peak_over_flux = float(sky.max() / sky.sum())
+    assert peak_over_flux < 0.2, f"peak/flux {peak_over_flux:.3f} suggests deltas remain"
+
+    # And the hybrid sky has strictly less total flux than the plain sky
+    ds_plain = CutoutDataset(compact_subtracted=False, **kwargs)
+    _, _, _, _, sky_plain = ds_plain[0]
+    assert float(sky.sum()) < float(sky_plain.sum())
+
+
+def test_compact_subtracted_rejects_point_morphology(psf_bank):
+    with pytest.raises(ValueError, match="compact_subtracted"):
+        CutoutDataset(
+            psf_bank=psf_bank, field_size=FIELD, cutout_size=CUTOUT,
+            morphology_balance={"point": 0.5, "blob": 0.5},
+            compact_subtracted=True,
+        )

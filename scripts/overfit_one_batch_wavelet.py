@@ -51,6 +51,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out_dir",   type=str, default="results/overfit_wavelet")
     p.add_argument("--extended_fraction", type=float, default=0.05)
     p.add_argument("--morphologies", type=str, default="point,blob,shell,filament")
+    p.add_argument("--compact_subtracted", action="store_true", default=True,
+                   help="Hybrid contract: point sources removed (delta step "
+                        "handles them in the loop). Default on.")
+    p.add_argument("--no_compact_subtracted", dest="compact_subtracted",
+                   action="store_false")
     p.add_argument("--calib_samples", type=int, default=256,
                    help="Sky cutouts used to calibrate the codec.")
     p.add_argument("--n_posterior", type=int, default=32)
@@ -64,6 +69,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def make_dataset(args, psf_bank, length, seed_offset=0):
     morph = {m.strip(): 1.0 for m in args.morphologies.split(",")}
+    if args.compact_subtracted and "point" in morph:
+        del morph["point"]
     return CutoutDataset(
         psf_bank=psf_bank,
         field_size=512,
@@ -75,6 +82,7 @@ def make_dataset(args, psf_bank, length, seed_offset=0):
         length=length,
         morphology_balance=morph,
         return_sky=True,
+        compact_subtracted=args.compact_subtracted,
     )
 
 

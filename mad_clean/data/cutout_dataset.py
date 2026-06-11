@@ -107,6 +107,15 @@ class CutoutDataset(Dataset):
         residual, Jy/pixel, distractors included) as a fifth tensor.
         Used by the wavelet-NPE head, whose target is the sky image
         itself rather than the 6D parameter vector. Default False.
+    compact_subtracted:
+        Hybrid minor-cycle contract: assume a delta-function step has
+        already (perfectly) subtracted all point sources before the
+        learned solver sees the residual.  Point distractors are removed
+        from the sky entirely (residual and target are extended-only),
+        and the centred morphology must not be "point".  The wavelet
+        codec cannot localise sub-beam structure (dropped w_1 plane), so
+        training it on points would bake in systematic position errors
+        that drift in the CLEAN loop. Default False.
     """
 
     _ALL_MORPHS = ("point", "blob", "shell", "filament")
@@ -125,6 +134,7 @@ class CutoutDataset(Dataset):
         morphology_balance: dict[str, float] | None = None,
         snr_min: float = 5.0,
         return_sky: bool = False,
+        compact_subtracted: bool = False,
     ) -> None:
         if len(psf_bank) == 0:
             raise ValueError("psf_bank is empty")
@@ -140,6 +150,11 @@ class CutoutDataset(Dataset):
         s = sum(morphology_balance.get(k, 0.0) for k in self._ALL_MORPHS)
         if s <= 0:
             raise ValueError("morphology_balance weights sum to <= 0")
+        if compact_subtracted and morphology_balance.get("point", 0.0) > 0:
+            raise ValueError(
+                "compact_subtracted=True excludes point sources; remove "
+                "'point' from morphology_balance"
+            )
         self._morph_keys  = list(self._ALL_MORPHS)
         self._morph_probs = np.array(
             [morphology_balance.get(k, 0.0) / s for k in self._morph_keys],
@@ -157,6 +172,7 @@ class CutoutDataset(Dataset):
         self._config_idx  = int(config_idx)
         self._snr_min     = float(snr_min)
         self._return_sky  = bool(return_sky)
+        self._compact_subtracted = bool(compact_subtracted)
 
     def __len__(self) -> int:
         return self._length
@@ -180,12 +196,30 @@ class CutoutDataset(Dataset):
         ]
 
         # 2. Generate distractor scene
-        sky, _ = assemble_mixed_field(
-            size=self._field_size,
-            n_sources=self._n_sources,
-            extended_rate=self._ext_rate,
-            rng=rng,
-        )
+        if self._compact_subtracted:
+            # Hybrid contract: point distractors removed entirely (the
+            # delta-function step subtracted them before this solver runs).
+            # Per-source rendering is requested so the extended-only sky
+            # can be rebuilt; rng consumption matches the plain call, so
+            # scenes stay deterministic per idx either way.
+            _sky_all, tgts, per_source = assemble_mixed_field(
+                size=self._field_size,
+                n_sources=self._n_sources,
+                extended_rate=self._ext_rate,
+                rng=rng,
+                return_per_source=True,
+            )
+            sky = np.zeros_like(_sky_all)
+            for tgt, img in zip(tgts, per_source):
+                if tgt.kind != "point":
+                    sky = sky + img
+        else:
+            sky, _ = assemble_mixed_field(
+                size=self._field_size,
+                n_sources=self._n_sources,
+                extended_rate=self._ext_rate,
+                rng=rng,
+            )
 
         # 3. Place centred source at a position with margin for the cutout
         margin = self._cutout_size // 2 + 4

@@ -43,6 +43,12 @@ def parse_args(argv=None):
                    default="point,blob,shell,filament")
     p.add_argument("--extended_fraction", type=float, default=0.05)
     p.add_argument("--snr_min",    type=float, default=5.0)
+    p.add_argument("--compact_subtracted", action="store_true", default=True,
+                   help="Hybrid contract: point sources removed from sky "
+                        "and morphologies (a delta-function step handles "
+                        "them in the loop). Default on for wavelet NPE.")
+    p.add_argument("--no_compact_subtracted", dest="compact_subtracted",
+                   action="store_false")
     p.add_argument("--calib_samples", type=int, default=1024,
                    help="Sky cutouts for codec calibration.")
     p.add_argument("--log_every",  type=int, default=100)
@@ -61,8 +67,12 @@ def parse_args(argv=None):
 
 
 def make_dataset(psf_bank, morphologies, extended_fraction, snr_min,
-                 size, seed_offset):
+                 size, seed_offset, compact_subtracted=False):
     morph = {m.strip(): 1.0 for m in morphologies.split(",")}
+    if compact_subtracted and "point" in morph:
+        del morph["point"]
+        print("[train] compact_subtracted: dropped 'point' from centred "
+              "morphologies")
     return CutoutDataset(
         psf_bank=psf_bank,
         field_size=512,
@@ -75,6 +85,7 @@ def make_dataset(psf_bank, morphologies, extended_fraction, snr_min,
         morphology_balance=morph,
         snr_min=snr_min,
         return_sky=True,
+        compact_subtracted=compact_subtracted,
     )
 
 
@@ -117,16 +128,19 @@ def run(args):
     else:
         calib_ds = make_dataset(psf_bank, args.morphologies,
                                 args.extended_fraction, args.snr_min,
-                                args.calib_samples, seed_offset=20_000_000)
+                                args.calib_samples, seed_offset=20_000_000,
+                                compact_subtracted=args.compact_subtracted)
         skies = torch.stack([calib_ds[i][4] for i in range(args.calib_samples)])
         codec = StarletCodec(image_size=128)
         codec.calibrate(skies)
     print(f"[train] theta_dim = {codec.theta_dim}")
 
     train_ds = make_dataset(psf_bank, args.morphologies, args.extended_fraction,
-                            args.snr_min, args.dataset_size, seed_offset=0)
+                            args.snr_min, args.dataset_size, seed_offset=0,
+                            compact_subtracted=args.compact_subtracted)
     val_ds   = make_dataset(psf_bank, args.morphologies, args.extended_fraction,
-                            args.snr_min, args.val_size,   seed_offset=10_000_000)
+                            args.snr_min, args.val_size,   seed_offset=10_000_000,
+                            compact_subtracted=args.compact_subtracted)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
