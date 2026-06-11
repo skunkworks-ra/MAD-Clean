@@ -142,18 +142,23 @@ def run(args) -> dict:
     samples = flow.sample(image, cond, n=args.n_posterior)  # (B, n, D)
     B, n, D = samples.shape
     dec = codec.decode(samples.reshape(B * n, D).cpu()).reshape(B, n, 128, 128)
-    post_mean = dec.mean(dim=1)
-    post_std  = dec.std(dim=1)
+    # Median, not mean: the sinh decode amplifies posterior tail samples
+    # exponentially, so the pixelwise mean is dominated by outliers.
+    post_med = dec.median(dim=1).values
+    post_std = dec.std(dim=1)
 
     per_sample = []
     for b in range(B):
         truth = sky[b]
-        err = float((post_mean[b] - truth).norm() / max(truth.norm(), 1e-12))
+        err = float((post_med[b] - truth).norm() / max(truth.norm(), 1e-12))
+        flux_samples = dec[b].sum(dim=(1, 2))
         per_sample.append({
-            "rel_l2_post_mean": err,
+            "rel_l2_post_median": err,
             "true_flux": float(truth.sum()),
-            "post_mean_flux": float(post_mean[b].sum()),
-            "post_flux_std": float(dec[b].sum(dim=(1, 2)).std()),
+            "post_median_flux": float(post_med[b].sum()),
+            "post_flux_iqr": float(
+                flux_samples.quantile(0.75) - flux_samples.quantile(0.25)
+            ),
         })
 
     # --- Plots --------------------------------------------------------------
@@ -165,9 +170,9 @@ def run(args) -> dict:
 
     fig, axes = plt.subplots(B, 4, figsize=(13, 3.2 * B))
     axes = np.atleast_2d(axes)
-    titles = ["residual", "true sky", "posterior mean", "posterior std"]
+    titles = ["residual", "true sky", "posterior median", "posterior std"]
     for b in range(B):
-        panels = [image[b, 0].cpu(), sky[b], post_mean[b], post_std[b]]
+        panels = [image[b, 0].cpu(), sky[b], post_med[b], post_std[b]]
         for k, (panel, title) in enumerate(zip(panels, titles)):
             im = axes[b, k].imshow(panel.numpy(), origin="lower")
             axes[b, k].set_title(title if b == 0 else "")

@@ -103,12 +103,17 @@ class StarletCodec:
         Default (1,) — the sub-beam plane.
     asinh_softening : per-plane softening b_j for asinh compression is
         ``asinh_softening * mad_j`` where mad_j comes from ``calibrate``.
+    z_clamp : decode-side clamp on standardised coefficients, in units of
+        the calibration std.  |z| beyond this is outside the calibrated
+        range and would be exponentially amplified by sinh; clamping
+        bounds the damage from posterior tail samples.  Default 6.0.
     """
 
     image_size: int = 128
     n_scales: int = 6
     drop_scales: tuple[int, ...] = (1,)
     asinh_softening: float = 1.0
+    z_clamp: float = 6.0
 
     # Per-kept-plane calibration: softening b_j and post-asinh std s_j.
     _b: list[float] = field(default_factory=list)
@@ -183,6 +188,7 @@ class StarletCodec:
             "n_scales": self.n_scales,
             "drop_scales": list(self.drop_scales),
             "asinh_softening": self.asinh_softening,
+            "z_clamp": self.z_clamp,
             "b": list(self._b),
             "s": list(self._s),
         }
@@ -194,6 +200,7 @@ class StarletCodec:
             n_scales=d["n_scales"],
             drop_scales=tuple(d["drop_scales"]),
             asinh_softening=d["asinh_softening"],
+            z_clamp=d.get("z_clamp", 6.0),
         )
         codec._b = list(d["b"])
         codec._s = list(d["s"])
@@ -244,6 +251,7 @@ class StarletCodec:
         for (side, n), b, s in zip(self.plane_dims(), self._b, self._s):
             z = theta[:, i : i + n].reshape(B, 1, side, side)
             i += n
+            z = z.clamp(-self.z_clamp, self.z_clamp)
             p = torch.sinh(z * s) * b
             if side != self.image_size:
                 p = F.interpolate(
