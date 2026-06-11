@@ -102,6 +102,11 @@ class CutoutDataset(Dataset):
     snr_min:
         Minimum SNR for the centred source's PSF-convolved peak relative to
         sigma_noise. Sources below this are rescaled up. Default 5.0.
+    return_sky:
+        If True, append the true-sky cutout (same crop window as the
+        residual, Jy/pixel, distractors included) as a fifth tensor.
+        Used by the wavelet-NPE head, whose target is the sky image
+        itself rather than the 6D parameter vector. Default False.
     """
 
     _ALL_MORPHS = ("point", "blob", "shell", "filament")
@@ -119,6 +124,7 @@ class CutoutDataset(Dataset):
         config_idx: int = _D_CONFIG_IDX,
         morphology_balance: dict[str, float] | None = None,
         snr_min: float = 5.0,
+        return_sky: bool = False,
     ) -> None:
         if len(psf_bank) == 0:
             raise ValueError("psf_bank is empty")
@@ -150,6 +156,7 @@ class CutoutDataset(Dataset):
         self._length      = int(length)
         self._config_idx  = int(config_idx)
         self._snr_min     = float(snr_min)
+        self._return_sky  = bool(return_sky)
 
     def __len__(self) -> int:
         return self._length
@@ -251,6 +258,10 @@ class CutoutDataset(Dataset):
         residual_t = torch.from_numpy(residual_cutout)
         psf_t      = torch.from_numpy(psf_cutout)
         target_t   = torch.from_numpy(target_np)
+
+        if self._return_sky:
+            sky_cutout = _safe_crop(sky.astype(np.float32), r0, r1, c0, c1)
+            return residual_t, psf_t, cond, target_t, torch.from_numpy(sky_cutout)
 
         return residual_t, psf_t, cond, target_t
 

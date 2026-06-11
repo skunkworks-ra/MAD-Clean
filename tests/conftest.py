@@ -97,8 +97,22 @@ if "mad_clean" not in sys.modules:
     sys.modules["mad_clean.models"] = _models
     setattr(pkg, "models", _models)
     for _name, _file in {
-        "mdn_asp": "mad_clean/models/mdn_asp.py",
+        "mdn_asp":    "mad_clean/models/mdn_asp.py",
+        "coeff_flow": "mad_clean/models/coeff_flow.py",
     }.items():
         _mod = _load_local(f"models.{_name}", _file)
         setattr(_models, _name, _mod)
         sys.modules[f"mad_clean.models.{_name}"] = _mod
+
+    # mad_clean.wavelet sub-package
+    _wavelet = types.ModuleType("mad_clean.wavelet")
+    _wavelet.__path__ = [str(ROOT / "mad_clean" / "wavelet")]
+    _wavelet.__package__ = "mad_clean.wavelet"
+    sys.modules["mad_clean.wavelet"] = _wavelet
+    setattr(pkg, "wavelet", _wavelet)
+    for _name, _file in {
+        "starlet": "mad_clean/wavelet/starlet.py",
+    }.items():
+        _mod = _load_local(f"wavelet.{_name}", _file)
+        setattr(_wavelet, _name, _mod)
+        sys.modules[f"mad_clean.wavelet.{_name}"] = _mod

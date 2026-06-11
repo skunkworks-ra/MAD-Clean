@@ -246,3 +246,34 @@ def test_residual_uses_as_rendered_not_gaussian_fit(psf_bank):
         reconstructed, sky, rtol=1e-5, atol=1e-6,
         err_msg="sum(per_source) must equal sky exactly",
     )
+
+
+def test_return_sky_cutout(psf_bank):
+    """With return_sky=True the dataset appends the true-sky cutout, which
+    must contain the centred source's flux near the cutout centre."""
+    ds = CutoutDataset(
+        psf_bank=psf_bank,
+        field_size=FIELD,
+        cutout_size=CUTOUT,
+        sigma_noise=1e-4,
+        n_sources_per_field=(3, 8),
+        rng_seed=0,
+        length=5,
+        return_sky=True,
+    )
+    out = ds[0]
+    assert len(out) == 5
+    residual, psf, cond, target, sky = out
+    assert sky.shape == (CUTOUT, CUTOUT)
+    assert sky.dtype == torch.float32
+    # First four tensors match the return_sky=False dataset exactly
+    ds0 = CutoutDataset(
+        psf_bank=psf_bank, field_size=FIELD, cutout_size=CUTOUT,
+        sigma_noise=1e-4, n_sources_per_field=(3, 8), rng_seed=0, length=5,
+    )
+    for a, b in zip(ds0[0], (residual, psf, cond, target)):
+        assert torch.equal(a, b)
+    # Centred source flux is present near the centre of the sky cutout
+    centre = CUTOUT // 2
+    core = sky[centre - 16: centre + 16, centre - 16: centre + 16]
+    assert float(core.sum()) > 0.0
