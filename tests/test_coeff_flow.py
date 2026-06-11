@@ -98,3 +98,35 @@ def test_context_dependence():
     lp1 = flow.log_prob(theta, image, cond)
     lp2 = flow.log_prob(theta, torch.randn_like(image), cond)
     assert not torch.allclose(lp1, lp2, atol=1e-6)
+
+
+def test_context_discriminates_at_physical_scale():
+    """The context encoder must produce distinct vectors for distinct scenes
+    at *physical* input amplitudes (residual ~1e-4 Jy, PSF peak ~1).
+
+    Regression test for the 2026-06-11 conditioning failure: with raw
+    inputs the GroupNorm statistics are dominated by the O(1) PSF channel
+    and the scene signal is a 1e-4 perturbation, so contexts collapse to
+    near-identical vectors and the flow trains unconditionally.
+    """
+    torch.manual_seed(0)
+    flow = _tiny_flow()
+    B = 4
+    # Distinct scenes at physical scale: sparse positive sources ~1e-4
+    residual = torch.zeros(B, 128, 128)
+    for b in range(B):
+        residual[b, 30 + 20 * b: 40 + 20 * b, 40: 60] = 1e-4
+    psf = torch.zeros(B, 128, 128)
+    psf[:, 64, 64] = 1.0
+    image = torch.stack([residual, psf], dim=1)
+    cond = torch.zeros(B, 5); cond[:, 0] = 1e-4; cond[:, 4] = 1.0
+    ctx = flow._context(image, cond)
+    # Pairwise distances between contexts must be a meaningful fraction of
+    # the context magnitude, not numerical dust.
+    d = torch.cdist(ctx, ctx)
+    off = d[~torch.eye(B, dtype=torch.bool)]
+    rel = float(off.min() / (ctx.norm(dim=1).mean() + 1e-12))
+    assert rel > 0.05, (
+        f"contexts nearly identical across distinct scenes (rel min dist "
+        f"{rel:.2e}); encoder cannot discriminate at physical input scale"
+    )

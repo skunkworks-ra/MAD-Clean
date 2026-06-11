@@ -145,8 +145,36 @@ def run(args) -> dict:
                   f"{losses[-1] / codec.theta_dim:8.4f}  "
                   f"elapsed={(time.time() - t0) / 60:.1f}m")
 
-    # --- Posterior reconstruction diagnostics ------------------------------
+    # --- Cross-assignment gate ---------------------------------------------
+    # A flow that memorised 8 image->theta mappings must score each scene's
+    # own theta best (rank 1).  An unconditional flow is uniform random.
+    # This is the PASS/FAIL gate before any full training run (added after
+    # the 2026-06-11 concat-conditioning failure).
     flow.eval()
+    B = args.n_samples
+    L = torch.zeros(B, B)
+    with torch.no_grad():
+        for b in range(B):
+            ib = image[b:b + 1].expand(B, -1, -1, -1)
+            cb = cond[b:b + 1].expand(B, -1)
+            L[b] = flow.log_prob(theta, ib, cb).cpu()
+    ranks = [int((L[b] > L[b, b]).sum()) + 1 for b in range(B)]
+    diagonal_wins = int(sum(r == 1 for r in ranks))
+    off = (L.sum() - L.diag().sum()) / (B * B - B)
+    cross = {
+        "ranks": ranks,
+        "diagonal_wins": diagonal_wins,
+        "n_samples": B,
+        "diag_nll_per_dim": float(-L.diag().mean() / codec.theta_dim),
+        "offdiag_nll_per_dim": float(-off / codec.theta_dim),
+        "gate_passed": diagonal_wins == B,
+    }
+    print(f"[overfit] cross-assignment gate: {diagonal_wins}/{B} diagonal "
+          f"wins — {'PASS' if cross['gate_passed'] else 'FAIL'} "
+          f"(diag nll/dim {cross['diag_nll_per_dim']:.4f}, "
+          f"offdiag {cross['offdiag_nll_per_dim']:.4f})")
+
+    # --- Posterior reconstruction diagnostics ------------------------------
     samples = flow.sample(image, cond, n=args.n_posterior)  # (B, n, D)
     B, n, D = samples.shape
     dec = codec.decode(samples.reshape(B * n, D).cpu()).reshape(B, n, 128, 128)
@@ -190,6 +218,7 @@ def run(args) -> dict:
     plt.close(fig)
 
     summary = {
+        "cross_assignment": cross,
         "final_nll_per_dim": losses[-1] / codec.theta_dim,
         "theta_dim": codec.theta_dim,
         "n_params": n_params,

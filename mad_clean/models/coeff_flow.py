@@ -10,9 +10,16 @@ Architecture
   (residual, PSF) 128x128 input, (sigma_local, config_one_hot) FiLM
   conditioning — producing a context vector.
 - Flow: stack of affine coupling layers (RealNVP style) with fixed
-  alternating binary masks and the context vector concatenated into every
-  coupling MLP.  Affine coupling is the simplest adequate choice; escalate
-  to splines only if coverage tests show miscalibration.
+  alternating binary masks.  The context FiLM-modulates every coupling
+  MLP's hidden layers.  The first version concatenated the context into
+  the MLP input instead; trained to step 3000 it ignored the context
+  completely (cross-assignment diagonal nll == off-diagonal to 4
+  decimals, eval_wavelet_npe.py 2026-06-11) — a 256-dim concat against
+  5472 theta dims is too easy to ignore.  FiLM forces every hidden unit
+  through a context-dependent affine map, the same mechanism that
+  demonstrably conditions the MDN.  Affine coupling is the simplest
+  adequate choice; escalate to splines only if coverage tests show
+  miscalibration.
 
 Loss is exact NLL: -log q(theta | context).  Sampling is exact and cheap
 (one MLP pass per coupling layer).
@@ -65,6 +72,15 @@ class _ContextEncoder(nn.Module):
         self.film2 = FiLMBlock(context_dim, cond_dim)
 
     def forward(self, image: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # Per-sample normalisation of the residual channel.  Physical
+        # residuals are ~1e-4 Jy while the PSF channel peaks at 1; without
+        # this the GroupNorm statistics are PSF-dominated and the contexts
+        # collapse to near-identical vectors (2026-06-11 conditioning
+        # failure, pinned by test_context_discriminates_at_physical_scale).
+        # Absolute scale is not lost: sigma_local is in ``cond``.
+        res, psf = image[:, 0:1], image[:, 1:2]
+        scale = res.flatten(1).std(dim=1).clamp_min(1e-12).view(-1, 1, 1, 1)
+        image = torch.cat([res / scale, psf], dim=1)
         h = self.enc(image).flatten(1)
         h = F.gelu(self.proj(h))
         h = self.film1(h, cond)
@@ -73,25 +89,29 @@ class _ContextEncoder(nn.Module):
 
 
 class _Coupling(nn.Module):
-    """One affine coupling layer with a fixed binary mask."""
+    """One affine coupling layer with a fixed binary mask.
+
+    The context FiLM-modulates both hidden layers — see module docstring
+    for why concat conditioning is not used.
+    """
 
     def __init__(self, dim: int, context_dim: int, hidden: int, mask: torch.Tensor):
         super().__init__()
         self.register_buffer("mask", mask.float())
-        self.net = nn.Sequential(
-            nn.Linear(dim + context_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 2 * dim),
-        )
+        self.fc_in = nn.Linear(dim, hidden)
+        self.film1 = FiLMBlock(hidden, context_dim)
+        self.film2 = FiLMBlock(hidden, context_dim)
+        self.fc_out = nn.Linear(hidden, 2 * dim)
         # Identity initialisation: zero the last layer so the flow starts
         # as the base distribution.
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        nn.init.zeros_(self.fc_out.weight)
+        nn.init.zeros_(self.fc_out.bias)
 
     def _st(self, x_masked: torch.Tensor, ctx: torch.Tensor):
-        h = self.net(torch.cat([x_masked, ctx], dim=-1))
+        h = F.gelu(self.fc_in(x_masked))
+        h = self.film1(h, ctx)
+        h = self.film2(h, ctx)
+        h = self.fc_out(h)
         s, t = h.chunk(2, dim=-1)
         s = _LOG_SCALE_CLAMP * torch.tanh(s / _LOG_SCALE_CLAMP)
         return s, t
