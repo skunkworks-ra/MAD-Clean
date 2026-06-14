@@ -116,3 +116,18 @@ if "mad_clean" not in sys.modules:
         _mod = _load_local(f"wavelet.{_name}", _file)
         setattr(_wavelet, _name, _mod)
         sys.modules[f"mad_clean.wavelet.{_name}"] = _mod
+
+    # mad_clean.imaging sub-package
+    _imaging = types.ModuleType("mad_clean.imaging")
+    _imaging.__path__ = [str(ROOT / "mad_clean" / "imaging")]
+    _imaging.__package__ = "mad_clean.imaging"
+    sys.modules["mad_clean.imaging"] = _imaging
+    setattr(pkg, "imaging", _imaging)
+    for _name, _file in {
+        "forward":  "mad_clean/imaging/forward.py",
+        "score":    "mad_clean/imaging/score.py",
+        "langevin": "mad_clean/imaging/langevin.py",
+    }.items():
+        _mod = _load_local(f"imaging.{_name}", _file)
+        setattr(_imaging, _name, _mod)
+        sys.modules[f"mad_clean.imaging.{_name}"] = _mod
