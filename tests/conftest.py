@@ -127,6 +127,7 @@ if "mad_clean" not in sys.modules:
         "forward":  "mad_clean/imaging/forward.py",
         "score":    "mad_clean/imaging/score.py",
         "langevin": "mad_clean/imaging/langevin.py",
+        "mgvi":     "mad_clean/imaging/mgvi.py",
     }.items():
         _mod = _load_local(f"imaging.{_name}", _file)
         setattr(_imaging, _name, _mod)
