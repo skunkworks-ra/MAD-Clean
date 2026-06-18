@@ -68,8 +68,12 @@ class _ContextEncoder(nn.Module):
         )
         feat_dim = 4 * c * 4 * 4
         self.proj = nn.Linear(feat_dim, context_dim)
-        self.film1 = FiLMBlock(context_dim, cond_dim)
-        self.film2 = FiLMBlock(context_dim, cond_dim)
+        # +1: the per-sample residual normalisation scale (log10) is
+        # appended to cond.  Without it absolute flux is unrecoverable —
+        # theta is in physical units but the image channel is divided by
+        # its own std, and sigma_local alone does not determine that std.
+        self.film1 = FiLMBlock(context_dim, cond_dim + 1)
+        self.film2 = FiLMBlock(context_dim, cond_dim + 1)
 
     def forward(self, image: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         # Per-sample normalisation of the residual channel.  Physical
@@ -77,10 +81,14 @@ class _ContextEncoder(nn.Module):
         # this the GroupNorm statistics are PSF-dominated and the contexts
         # collapse to near-identical vectors (2026-06-11 conditioning
         # failure, pinned by test_context_discriminates_at_physical_scale).
-        # Absolute scale is not lost: sigma_local is in ``cond``.
+        # The scale itself is appended to cond as log10 so the network
+        # can map the normalised image back to absolute flux (sigma_local
+        # alone is the noise level, not this factor).
         res, psf = image[:, 0:1], image[:, 1:2]
         scale = res.flatten(1).std(dim=1).clamp_min(1e-12).view(-1, 1, 1, 1)
         image = torch.cat([res / scale, psf], dim=1)
+        cond = torch.cat(
+            [cond, torch.log10(scale.flatten(1))], dim=-1)
         h = self.enc(image).flatten(1)
         h = F.gelu(self.proj(h))
         h = self.film1(h, cond)
@@ -117,13 +125,16 @@ class _Coupling(nn.Module):
         return s, t
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor):
-        """x -> z. Returns (z, log_det)."""
+        """x -> z. Returns (z, log_det_dims) with per-dim log-det (B, D).
+
+        Affine couplings have a diagonal Jacobian on the free dims, so the
+        log-det decomposes per dimension — which is what makes the
+        support-weighted NLL exact dimension-wise."""
         xm = x * self.mask
         s, t = self._st(xm, ctx)
         free = 1.0 - self.mask
         z = xm + free * (x * torch.exp(s) + t)
-        log_det = (free * s).sum(dim=-1)
-        return z, log_det
+        return z, free * s
 
     def inverse(self, z: torch.Tensor, ctx: torch.Tensor):
         zm = z * self.mask
@@ -167,7 +178,7 @@ class CoeffFlow(nn.Module):
         theta_dim: int,
         base_channels: int = 32,
         context_dim: int = 256,
-        hidden: int = 512,
+        hidden: int = 128,
         n_layers: int = 8,
         cond_dim: int = COND_DIM,
     ):
@@ -182,24 +193,58 @@ class CoeffFlow(nn.Module):
     def _context(self, image: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         return self.encoder(image, cond)
 
+    def _log_prob_given_ctx(self, theta, ctx):
+        """Per-dim log-density for theta under a precomputed context.
+
+        theta (M, D), ctx (M, C) -> (M, D).  Factored out so the conv
+        encoder can be run once and its context reused across many theta
+        (cross-assignment matrix, in-support split)."""
+        z = theta
+        log_det = torch.zeros_like(theta)
+        for layer in self.layers:
+            z, ld = layer(z, ctx)
+            log_det = log_det + ld
+        return -0.5 * (z ** 2 + math.log(2.0 * math.pi)) + log_det
+
+    def log_prob_per_dim(self, theta, image, cond) -> torch.Tensor:
+        """Unweighted per-dim log-density, (B, D).  Lets the caller split
+        the NLL by support (source vs background coefficients)."""
+        return self._log_prob_given_ctx(theta, self._context(image, cond))
+
     def log_prob(
         self,
         theta: torch.Tensor,   # (B, theta_dim)
         image: torch.Tensor,   # (B, 2, 128, 128)
         cond:  torch.Tensor,   # (B, cond_dim)
+        dim_weights: torch.Tensor | None = None,  # (B, theta_dim)
     ) -> torch.Tensor:
-        """Exact log q(theta | image, cond). Returns (B,)."""
-        ctx = self._context(image, cond)
-        z = theta
-        log_det = torch.zeros(theta.shape[0], device=theta.device)
-        for layer in self.layers:
-            z, ld = layer(z, ctx)
-            log_det = log_det + ld
-        log_base = -0.5 * (z ** 2 + math.log(2.0 * math.pi)).sum(dim=-1)
-        return log_base + log_det
+        """log q(theta | image, cond). Returns (B,).
 
-    def nll_loss(self, theta, image, cond) -> torch.Tensor:
-        return -self.log_prob(theta, image, cond).mean()
+        With ``dim_weights`` the per-dim base term and per-dim coupling
+        log-det are weighted before summing (a tempered likelihood for
+        training only — see StarletCodec.support_weights).  Without it
+        this is the exact NLL; evaluation must always use the unweighted
+        form."""
+        per_dim = self.log_prob_per_dim(theta, image, cond)
+        if dim_weights is not None:
+            per_dim = per_dim * dim_weights
+        return per_dim.sum(dim=-1)
+
+    def log_prob_matrix(self, theta, image, cond) -> torch.Tensor:
+        """Cross-assignment matrix L[i, j] = log q(theta_j | image_i).
+
+        Context is computed once per image (B conv passes) and reused
+        across all theta, so cost scales as B conv + B**2 coupling MLP
+        rather than B**2 conv.  Used for the in-batch InfoNCE term."""
+        B = theta.shape[0]
+        ctx = self._context(image, cond)                  # (B, C)
+        ctx_rep = ctx.repeat_interleave(B, dim=0)          # row i, B times
+        theta_rep = theta.repeat(B, 1)                     # theta tiled per row
+        per_dim = self._log_prob_given_ctx(theta_rep, ctx_rep)
+        return per_dim.sum(dim=-1).view(B, B)
+
+    def nll_loss(self, theta, image, cond, dim_weights=None) -> torch.Tensor:
+        return -self.log_prob(theta, image, cond, dim_weights).mean()
 
     @torch.no_grad()
     def sample(

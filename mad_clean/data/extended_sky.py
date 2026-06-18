@@ -35,6 +35,7 @@ __all__ = [
     "render_gaussian_blob",
     "render_shell",
     "render_filament",
+    "render_disk_ring",
     "assemble_mixed_field",
 ]
 
@@ -258,7 +259,10 @@ def render_filament(
     if rng is None:
         rng = np.random.default_rng()
 
-    margin = int(math.ceil(SIGMA_MAX_PX * 3))
+    # Margin based on width only -- filament ends can extend to the image edge.
+    if width is None:
+        width = rng.uniform(BEAM_SIGMA_PX, SIGMA_MAX_PX)
+    margin = int(math.ceil(width * 3))
     lo = margin
     hi = size - margin
 
@@ -269,10 +273,8 @@ def render_filament(
     if pa is None:
         pa = rng.uniform(0.0, math.pi)
     if length is None:
-        # Length such that half-length ≤ SIGMA_MAX_PX
-        length = rng.uniform(2 * BEAM_SIGMA_PX, 2 * SIGMA_MAX_PX)
-    if width is None:
-        width = rng.uniform(BEAM_SIGMA_PX, SIGMA_MAX_PX)
+        # Half-length up to 45% of the image so filaments can span the frame.
+        length = rng.uniform(4 * BEAM_SIGMA_PX, 0.9 * size)
 
     half_len = length / 2.0
 
@@ -321,10 +323,84 @@ def render_filament(
 
 
 # ---------------------------------------------------------------------------
+# Generator 4: Disk with rings
+# ---------------------------------------------------------------------------
+
+def render_disk_ring(
+    size: int = 128,
+    cx: float | None = None,
+    cy: float | None = None,
+    flux_jy: float = 1.0,
+    disk_radius: float | None = None,
+    n_rings: int | None = None,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, Target6D]:
+    """Render a flat disk with 1-2 concentric rings.
+
+    Distinct from the PSF (single peaked) and from a shell (limb-brightened
+    sphere): this is a filled disk with superimposed annular rings at larger
+    radii, as seen in protoplanetary disks or radio galaxy lobes with ring
+    substructure.
+
+    Target encoding: σ_maj = σ_min = outermost ring radius, PA = 0
+    (circular morphology).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if disk_radius is None:
+        disk_radius = rng.uniform(BEAM_SIGMA_PX, SIGMA_MAX_PX * 0.5)
+    if n_rings is None:
+        n_rings = int(rng.integers(1, 3))  # 1 or 2 rings
+
+    margin = int(math.ceil(SIGMA_MAX_PX * 2 + 3))
+    lo = margin
+    hi = size - margin
+    if cx is None:
+        cx = rng.uniform(lo, hi)
+    if cy is None:
+        cy = rng.uniform(lo, hi)
+
+    X, Y = _make_xy_grids(size)
+    r = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+
+    # Central disk: Gaussian with sigma = disk_radius
+    profile = np.exp(-0.5 * (r / disk_radius) ** 2)
+
+    # Concentric rings spaced beyond the disk
+    ring_width = max(BEAM_SIGMA_PX, disk_radius * 0.3)
+    outermost_radius = disk_radius
+    for k in range(1, n_rings + 1):
+        ring_radius = disk_radius * (1.5 + k * 0.8)
+        outermost_radius = ring_radius
+        ring_flux = rng.uniform(0.3, 0.9)  # ring amplitude relative to disk
+        profile = profile + ring_flux * np.exp(
+            -0.5 * ((r - ring_radius) / ring_width) ** 2
+        )
+
+    total = profile.sum()
+    if total > 0:
+        profile /= total
+    image = (flux_jy * profile).astype(np.float32)
+
+    target = Target6D(
+        x=float(cx),
+        y=float(cy),
+        log_flux=float(math.log(flux_jy)),
+        log_sig_maj=float(math.log(max(outermost_radius, BEAM_SIGMA_PX))),
+        log_sig_min=float(math.log(max(outermost_radius, BEAM_SIGMA_PX))),
+        pa=0.0,
+        kind="disk_ring",
+    )
+    return image, target
+
+
+# ---------------------------------------------------------------------------
 # Mixed-field assembler
 # ---------------------------------------------------------------------------
 
-_EXTENDED_GENERATORS = [render_gaussian_blob, render_shell, render_filament]
+_EXTENDED_GENERATORS = [render_gaussian_blob, render_shell, render_filament,
+                        render_disk_ring]
 
 
 def assemble_mixed_field(

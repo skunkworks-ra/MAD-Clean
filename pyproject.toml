@@ -45,3 +45,5 @@ train-patch-gpu = "python scripts/run_train.py --variant A --data crumb_data/flo
 train-conv-gpu  = "python scripts/run_train.py --variant B --data crumb_data/flow_pairs.npz --out models/cdl_filters_conv.npy --k 128 --lmbda 0.1 --n_epochs 50 --device cuda"
 train-flow-gpu  = "python scripts/run_train.py --variant C --data crumb_data/flow_pairs.npz --out models/flow_model.pt --n_epochs 100 --batch_size 8 --lr 1e-4 --device cuda"
 train-field-score-gpu = "python scripts/train_field_score.py --out models/field_score.pt --size 512 --base_channels 32 --steps 100000 --batch_size 8 --lr 1e-4 --device cuda"
+train-field-score-linear-gpu = "python scripts/train_field_score.py --out models/field_score_linear.pt --space linear --size 512 --diffuse_flux 0.05 --base_channels 32 --steps 100000 --batch_size 8 --lr 1e-4 --device cuda"
+train-wavelet-npe-gpu = "python scripts/train_wavelet_npe.py --out_dir results/wavelet_npe_train_v5 --steps 50000 --batch_size 8 --hidden 128 --n_layers 8 --infonce_weight 5.0 --val_size 200 --device cuda:1"

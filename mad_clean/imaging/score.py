@@ -193,12 +193,20 @@ def edm_loss(
     p_mean: float = -1.2,
     p_std: float = 1.2,
     generator: torch.Generator | None = None,
+    pixel_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """EDM denoising score-matching loss on a clean log-sky batch ``f0`` (B,1,H,W).
 
     Samples ``ln σ ~ N(p_mean, p_std)`` per example, noises ``f0``, and returns
     the σ-weighted denoiser MSE ``λ(σ)‖D_θ(f0+n, σ) − f0‖²`` with
-    ``λ(σ) = (σ²+σ_data²)/(σ·σ_data)²``."""
+    ``λ(σ) = (σ²+σ_data²)/(σ·σ_data)²``.
+
+    ``pixel_weight`` (B,1,H,W or broadcastable, default ``None``) is an optional
+    per-pixel weight multiplied into the squared error.  With ``None`` the loss
+    is the standard pixel-uniform DSM, where rare bright source pixels (~0.1% of
+    the field) carry ~0.1% of the gradient and are learned poorly.  Passing a
+    flux-proportional weight rebalances the gradient toward sources — the lever
+    the overfit gate tests."""
     b = f0.shape[0]
     ln_sigma = p_mean + p_std * torch.randn(b, generator=generator, device=f0.device)
     sigma = ln_sigma.exp()
@@ -208,4 +216,7 @@ def edm_loss(
     d = model(x, sigma)
     sd = model.sigma_data
     weight = (s**2 + sd**2) / (s * sd) ** 2
-    return (weight * (d - f0) ** 2).mean()
+    se = (d - f0) ** 2
+    if pixel_weight is not None:
+        se = se * pixel_weight
+    return (weight * se).mean()

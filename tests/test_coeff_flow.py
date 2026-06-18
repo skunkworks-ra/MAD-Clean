@@ -126,7 +126,54 @@ def test_context_discriminates_at_physical_scale():
     d = torch.cdist(ctx, ctx)
     off = d[~torch.eye(B, dtype=torch.bool)]
     rel = float(off.min() / (ctx.norm(dim=1).mean() + 1e-12))
-    assert rel > 0.05, (
+    # The 2026-06-11 collapse produced rel ~1e-6 (numerical dust). A healthy
+    # encoder at random init lands ~1e-2..1e-1 depending on seed and layer
+    # widths, so the bar separates collapse from health without being
+    # init-sensitive.
+    assert rel > 0.01, (
         f"contexts nearly identical across distinct scenes (rel min dist "
         f"{rel:.2e}); encoder cannot discriminate at physical input scale"
+    )
+
+
+def test_weighted_log_prob_matches_unweighted_at_ones():
+    flow = _tiny_flow()
+    theta, image, cond = _inputs()
+    lp = flow.log_prob(theta, image, cond)
+    lp_w = flow.log_prob(theta, image, cond,
+                         dim_weights=torch.ones(_B, _THETA_DIM))
+    assert torch.allclose(lp, lp_w, atol=1e-5)
+
+
+def test_weighted_log_prob_downweights_dims():
+    """Zero weight on every dim must give zero log-prob; intermediate
+    weights must change the value."""
+    flow = _tiny_flow()
+    theta, image, cond = _inputs()
+    lp0 = flow.log_prob(theta, image, cond,
+                        dim_weights=torch.zeros(_B, _THETA_DIM))
+    assert torch.allclose(lp0, torch.zeros(_B), atol=1e-6)
+    w = torch.full((_B, _THETA_DIM), 0.5)
+    lp_half = flow.log_prob(theta, image, cond, dim_weights=w)
+    lp_full = flow.log_prob(theta, image, cond)
+    assert torch.allclose(lp_half, 0.5 * lp_full, atol=1e-5)
+
+
+def test_context_carries_absolute_scale():
+    """Two residuals identical up to a flux scale must produce different
+    contexts: the per-sample normalisation divides the scale out of the
+    image, so it has to re-enter through cond (log10 scale append)."""
+    flow = _tiny_flow()
+    torch.manual_seed(3)
+    res = torch.randn(1, 1, 128, 128) * 1e-4
+    psf = torch.randn(1, 1, 128, 128)
+    cond = torch.zeros(1, 5)
+    img_a = torch.cat([res, psf], dim=1)
+    img_b = torch.cat([res * 100.0, psf], dim=1)
+    ctx_a = flow._context(img_a, cond)
+    ctx_b = flow._context(img_b, cond)
+    rel = (ctx_a - ctx_b).norm() / ctx_a.norm().clamp_min(1e-12)
+    assert float(rel) > 1e-3, (
+        f"contexts identical across a 100x flux rescale (rel {rel:.2e}); "
+        "absolute scale is not reaching the network"
     )

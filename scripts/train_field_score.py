@@ -43,30 +43,53 @@ from mad_clean.imaging.score import EDMDenoiser, UNet, edm_loss
 _S_FLOOR = 1e-8
 
 
+def _to_field(s: np.ndarray, space: str) -> np.ndarray:
+    """Map a linear sky ``s`` to the training space.
+
+    'log'    : f = log(max(s, floor)) — positivity by exp, but densifies a
+               sparse sky into a full-support floor (the source-destroying
+               representation isolated by the overfit gate).
+    'linear' : the sky itself — empty sky is genuinely zero, sparse stays
+               sparse; positivity is enforced in the sampler by clamp."""
+    if space == "log":
+        return np.log(np.maximum(s, _S_FLOOR)).astype(np.float32)
+    return s.astype(np.float32)
+
+
 class CorpusStream(IterableDataset):
-    """Infinite stream of clean log-sky fields f = log(s), generated on the fly.
+    """Infinite stream of clean fields in the chosen space, generated on the fly.
 
     Each DataLoader worker seeds its own RNG (base_seed + worker_id) so workers
     produce distinct, non-overlapping field streams; with ``num_workers > 0`` the
     corpus is generated in parallel and prefetched while the GPU trains."""
 
-    def __init__(self, size: int, base_seed: int):
+    def __init__(self, size: int, base_seed: int, space: str, diffuse_flux: float):
         self.size = size
         self.base_seed = base_seed
+        self.space = space
+        self.diffuse_flux = diffuse_flux
 
     def __iter__(self):
         info = get_worker_info()
         wid = 0 if info is None else info.id
         rng = np.random.default_rng(self.base_seed + wid)
         while True:
-            s = assemble_corpus_field(size=self.size, rng=rng)
-            yield np.log(np.maximum(s, _S_FLOOR)).astype(np.float32)
+            s = assemble_corpus_field(
+                size=self.size, diffuse_flux_jy=self.diffuse_flux, rng=rng)
+            yield _to_field(s, self.space)
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Train the field prior score model.")
     p.add_argument("--out", type=str, default="models/field_score.pt")
+    p.add_argument("--space", choices=["log", "linear"], default="log",
+                   help="Training representation. 'linear' keeps a sparse sky "
+                        "sparse (the gate-validated fix); 'log' is the original.")
     p.add_argument("--size", type=int, default=512, help="Full field side (px).")
+    p.add_argument("--diffuse_flux", type=float, default=1.0,
+                   help="Total diffuse flux (Jy) of the corpus. Low (e.g. 0.05) "
+                        "= source-prominent sky (the gate-validated regime); 1.0 "
+                        "= diffuse-dominated (the original, which collapses).")
     p.add_argument("--steps", type=int, default=100_000)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -85,22 +108,24 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def make_log_sky_batch(
-    batch_size: int, size: int, rng: np.random.Generator
+def make_field_batch(
+    batch_size: int, size: int, rng: np.random.Generator, space: str,
+    diffuse_flux: float,
 ) -> np.ndarray:
-    """A batch of clean log-sky fields f = log(s), shape (B, H, W) float32."""
+    """A batch of clean fields in ``space``, shape (B, H, W) float32."""
     out = np.empty((batch_size, size, size), dtype=np.float32)
     for i in range(batch_size):
-        s = assemble_corpus_field(size=size, rng=rng)
-        out[i] = np.log(np.maximum(s, _S_FLOOR))
+        s = assemble_corpus_field(size=size, diffuse_flux_jy=diffuse_flux, rng=rng)
+        out[i] = _to_field(s, space)
     return out
 
 
 def measure_standardisation(
-    n_fields: int, size: int, rng: np.random.Generator
+    n_fields: int, size: int, rng: np.random.Generator, space: str,
+    diffuse_flux: float,
 ) -> tuple[float, float]:
-    """Measure (mu, tau) = (mean, std) of clean log-sky over ``n_fields``."""
-    vals = make_log_sky_batch(n_fields, size, rng)
+    """Measure (mu, tau) = (mean, std) of the clean field over ``n_fields``."""
+    vals = make_field_batch(n_fields, size, rng, space, diffuse_flux)
     return float(vals.mean()), float(vals.std() + 1e-8)
 
 
@@ -114,9 +139,11 @@ def main(argv=None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ── standardisation (measured once) ──────────────────────────────────────
-    print(f"Measuring log-sky standardisation over {args.warmup_fields} fields…")
-    mu, tau = measure_standardisation(args.warmup_fields, args.size, rng)
-    print(f"  mu={mu:.4f}  tau={tau:.4f}  (σ_data set to 1.0 in standardised space)")
+    print(f"Measuring {args.space}-sky standardisation over {args.warmup_fields} fields…")
+    mu, tau = measure_standardisation(
+        args.warmup_fields, args.size, rng, args.space, args.diffuse_flux)
+    print(f"  space={args.space}  diffuse_flux={args.diffuse_flux}  "
+          f"mu={mu:.4g}  tau={tau:.4g}  (σ_data set to 1.0 in standardised space)")
 
     # ── model ────────────────────────────────────────────────────────────────
     net = UNet(in_ch=1, base=args.base_channels)
@@ -136,14 +163,17 @@ def main(argv=None) -> None:
                 "sigma_data": 1.0,
                 "mu": mu,
                 "tau": tau,
-                "config": {"size": args.size, "base_channels": args.base_channels},
+                "space": args.space,
+                "config": {"size": args.size, "base_channels": args.base_channels,
+                           "space": args.space, "diffuse_flux": args.diffuse_flux},
             },
             out_path,
         )
 
     # ── corpus stream (parallel generation, prefetched) ──────────────────────
     loader = DataLoader(
-        CorpusStream(args.size, base_seed=args.seed + 1),
+        CorpusStream(args.size, base_seed=args.seed + 1, space=args.space,
+                     diffuse_flux=args.diffuse_flux),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,

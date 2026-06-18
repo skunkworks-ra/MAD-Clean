@@ -46,6 +46,7 @@ __all__ = [
     "annealed_langevin",
     "geometric_sigma_schedule",
     "make_field_posterior_score",
+    "measure_data_scale",
     "sample_field_posterior",
 ]
 
@@ -123,6 +124,37 @@ def annealed_langevin(
     return x
 
 
+def _state_to_sky(
+    x: torch.Tensor, mu: float, tau: float, space: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Change of variables from the standardised state ``x`` to linear sky ``s``,
+    returning ``(s, ds/dx)`` for the data-term Jacobian.
+
+    - ``"log"``    : ``s = exp(mu + tau·x)`` (RESOLVE positivity, flux rearranges
+                     in log-space), ``ds/dx = tau·s``.  The ``exp`` is the source
+                     of the log-sky densification — a sparse sky has no zero in
+                     log-space, every pixel carries a finite floor.
+    - ``"linear"`` : ``s = relu(mu + tau·x)`` (positivity by clamp, empty sky is
+                     genuinely zero), ``ds/dx = tau`` where ``s > 0`` else 0.  This
+                     keeps a sparse sky sparse so the prior loss is not dominated
+                     by a dense floor (the overfit_field_inloop gate isolated the
+                     log-sky floor as the source-destroying mechanism).
+    """
+    raw = mu + tau * x
+    if space == "log":
+        s = torch.exp(torch.clamp(raw, max=_EXP_CLAMP_MAX))
+        jac = tau * s
+    elif space == "linear":
+        s = torch.clamp(raw, min=0.0)
+        jac = tau * (raw > 0).to(s.dtype)
+        # Constant Jacobian (no s factor): the data gradient on a bright pixel
+        # does not vanish the way tau·s does for a faint one — sources are not
+        # down-weighted by their own (small, in log-space) value.
+    else:
+        raise ValueError(f"space must be 'log' or 'linear'; got {space!r}")
+    return s, jac
+
+
 def make_field_posterior_score(
     forward_op: ImageDomainForward,
     score_model: EDMDenoiser,
@@ -130,25 +162,66 @@ def make_field_posterior_score(
     mu: float,
     tau: float,
     noise_std: float,
+    data_scale: float = 1.0,
+    space: str = "log",
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Build the log-sky posterior-score closure for one observation ``d``.
+    """Build the posterior-score closure for one observation ``d``.
 
-    Input/output states are standardised log-sky ``f'`` of shape ``(B, H, W)``.
+    Input/output states are the standardised field ``x`` of shape ``(B, H, W)``
+    in the space named by ``space`` (``"log"`` ⇒ standardised log-sky, the
+    original Fork-A formulation; ``"linear"`` ⇒ standardised linear sky).  The
+    prior ``score_model`` must have been trained in the SAME space — the model is
+    space-agnostic, the standardisation ``(mu, tau)`` and this closure carry the
+    space.
+
+    ``data_scale`` multiplies the data term before it is added to the prior
+    score.  The two terms live on different scales — the prior score is O(1) per
+    pixel while the data term carries the ``1/noise_std²`` likelihood weight — so
+    combining them at unit weight lets the data term overshoot the annealing step
+    and rail.  ``data_scale`` is the single measured scalar that puts the data
+    term on the prior's scale, mirroring the flow encoder's per-sample residual
+    normalisation.  ``1.0`` reproduces the raw additive score.
     """
 
-    def posterior_score(f_std: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        # Prior score in standardised log-sky space (add/remove channel dim).
-        prior = score_model.score(f_std.unsqueeze(1), sigma).squeeze(1)
-        # Data score via the change of variables s = exp(mu + tau·f').  The clamp
-        # is a defensive guard against transient excursions overflowing exp; the
-        # sampler's ``project`` keeps f' in the same band, so it rarely binds.
-        s = torch.exp(torch.clamp(mu + tau * f_std, max=_EXP_CLAMP_MAX))
+    def posterior_score(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        # Prior score in the standardised space (add/remove channel dim).
+        prior = score_model.score(x.unsqueeze(1), sigma).squeeze(1)
+        # Data score via the change of variables s(x); jac = ds/dx.
+        s, jac = _state_to_sky(x, mu, tau, space)
         r = d - forward_op.forward(s)
         lik = forward_op.adjoint(r) / (noise_std**2)  # A^T N^{-1} r
-        data = tau * s * lik
-        return prior + data
+        data = jac * lik
+        return prior + data_scale * data
 
     return posterior_score
+
+
+def measure_data_scale(
+    forward_op: ImageDomainForward,
+    score_model: EDMDenoiser,
+    d: torch.Tensor,
+    mu: float,
+    tau: float,
+    noise_std: float,
+    sigma_max: float = 5.0,
+    space: str = "log",
+) -> float:
+    """λ = |prior score| / |data score| at cold init (state = 0) and σ = σ_max.
+
+    The single measured scalar that brings the likelihood term onto the prior
+    score's scale — the flow encoder's "measure the residual scale and divide"
+    move, here matched at the top annealing level where the raw run overshoots.
+    Space-aware via :func:`_state_to_sky`, so it works for both 'log' and
+    'linear' priors.  Returns a positive float; multiply by a small factor if a
+    stronger/weaker data term is wanted (the in-loop gate's coupling knob).
+    """
+    H, W = forward_op.shape
+    f0 = torch.zeros(1, H, W, device=d.device, dtype=d.dtype)
+    sig = torch.tensor(float(sigma_max), device=d.device, dtype=d.dtype)
+    prior = score_model.score(f0.unsqueeze(1), sig).squeeze(1)
+    s, jac = _state_to_sky(f0, mu, tau, space)
+    data = jac * (forward_op.adjoint(d - forward_op.forward(s)) / noise_std**2)
+    return float(prior.norm() / (data.norm() + 1e-30))
 
 
 def sample_field_posterior(
@@ -166,15 +239,19 @@ def sample_field_posterior(
     step_size: float = 1e-5,
     init_std: float = 1.0,
     f_clip: tuple[float, float] = (-20.0, 20.0),
+    data_scale: float | str = 1.0,
+    space: str = "log",
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Draw ``n_samples`` field posterior samples (in linear sky space ``s``).
 
-    The sampler runs in standardised log-sky; the returned samples are
-    ``s = exp(mu + tau·f')`` — strictly positive by construction.  ``step_size``
-    is the Song-Ermon ε and must stay small (the per-level step grows as
-    ``(σ_t/σ_min)²``).  ``f_clip`` bounds the standardised state each step to keep
-    ``exp`` finite (a numerical guard, not a physical prior).
+    The sampler runs in the standardised space named by ``space`` (``"log"`` ⇒
+    standardised log-sky, ``"linear"`` ⇒ standardised linear sky); the returned
+    samples are mapped back to linear sky ``s`` and are non-negative by
+    construction (``exp`` for log, ``relu`` for linear).  ``step_size`` is the
+    Song-Ermon ε and must stay small (the per-level step grows as
+    ``(σ_t/σ_min)²``).  ``f_clip`` bounds the standardised state each step (a
+    numerical guard, not a physical prior).
 
     Returns
     -------
@@ -184,11 +261,18 @@ def sample_field_posterior(
     device = d.device
     sigmas = geometric_sigma_schedule(sigma_max, sigma_min, n_levels, device=device)
 
+    if isinstance(data_scale, str):
+        if data_scale != "auto":
+            raise ValueError(f"data_scale string must be 'auto'; got {data_scale!r}")
+        data_scale = measure_data_scale(
+            forward_op, score_model, d, mu, tau, noise_std, sigma_max, space)
+
     init = init_std * torch.randn(
         n_samples, H, W, generator=generator, device=device, dtype=d.dtype
     )
     pscore = make_field_posterior_score(
-        forward_op, score_model, d, mu, tau, noise_std
+        forward_op, score_model, d, mu, tau, noise_std,
+        data_scale=data_scale, space=space,
     )
     lo, hi = f_clip
     f_std = annealed_langevin(
@@ -198,4 +282,5 @@ def sample_field_posterior(
         generator=generator,
         project=lambda x: x.clamp(lo, hi),
     )
-    return torch.exp(mu + tau * f_std)
+    s, _ = _state_to_sky(f_std, mu, tau, space)
+    return s

@@ -51,18 +51,35 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out_dir",   type=str, default="results/overfit_wavelet")
     p.add_argument("--extended_fraction", type=float, default=0.05)
     p.add_argument("--morphologies", type=str, default="point,blob,shell,filament")
-    p.add_argument("--compact_subtracted", action="store_true", default=True,
+    p.add_argument("--compact_subtracted", action="store_true", default=False,
                    help="Hybrid contract: point sources removed (delta step "
-                        "handles them in the loop). Default on.")
+                        "handles them in the loop). Default off.")
     p.add_argument("--no_compact_subtracted", dest="compact_subtracted",
                    action="store_false")
+    p.add_argument("--drop_scales", type=str, default="",
+                   help="Comma-separated 1-based detail planes to drop. "
+                        "Default none (w_1 kept), matching train_wavelet_npe.")
+    p.add_argument("--theta_jitter", type=float, default=0.05,
+                   help="Dequantisation noise std on theta during training "
+                        "(matches train_wavelet_npe). 0 disables.")
     p.add_argument("--calib_samples", type=int, default=256,
                    help="Sky cutouts used to calibrate the codec.")
     p.add_argument("--n_posterior", type=int, default=32)
+    # Contrastive (InfoNCE) auxiliary.  MLE alone does not penalise a model
+    # that puts the same (marginal-mean) mass on every scene; the softmax
+    # over candidate thetas does, by normalising across alternatives.  This
+    # is the cross-assignment gate turned into a training signal.
+    p.add_argument("--infonce_weight", type=float, default=0.0,
+                   help="Weight lambda on the InfoNCE term. 0 => pure NLL "
+                        "(reproduces prior behaviour).")
+    p.add_argument("--infonce_temp", type=float, default=0.0,
+                   help="Softmax temperature tau for the L[b,c] logits. "
+                        "0 => divide by theta_dim (per-dim logits, O(1) "
+                        "scale); otherwise logits are divided by tau.")
     # Model size (defaults match the planned full run)
     p.add_argument("--base_channels", type=int, default=32)
     p.add_argument("--context_dim",   type=int, default=256)
-    p.add_argument("--hidden",        type=int, default=512)
+    p.add_argument("--hidden",        type=int, default=128)
     p.add_argument("--n_layers",      type=int, default=8)
     return p.parse_args(argv)
 
@@ -103,7 +120,8 @@ def run(args) -> dict:
     calib_skies = torch.stack(
         [calib_ds[i][4] for i in range(args.calib_samples)]
     )
-    codec = StarletCodec(image_size=128)
+    drops = tuple(int(x) for x in args.drop_scales.split(",") if x.strip())
+    codec = StarletCodec(image_size=128, drop_scales=drops)
     codec.calibrate(calib_skies)
     print(f"[overfit] codec theta_dim = {codec.theta_dim}")
 
@@ -129,20 +147,47 @@ def run(args) -> dict:
     n_params = sum(p.numel() for p in flow.parameters())
     print(f"[overfit] model parameters: {n_params:,}")
 
-    opt = optim.Adam(flow.parameters(), lr=args.lr)
+    opt = optim.Adam(flow.parameters(), lr=args.lr, foreach=False)
     losses = []
+    nlls = []
+    infonces = []
+    B = args.n_samples
+    tau = args.infonce_temp if args.infonce_temp > 0 else float(codec.theta_dim)
+    targets = torch.arange(B, device=device)
     t0 = time.time()
     flow.train()
+    import torch.nn.functional as F  # noqa: E402
     for step in range(1, args.steps + 1):
         opt.zero_grad()
-        loss = flow.nll_loss(theta, image, cond)
+        theta_step = theta
+        if args.theta_jitter > 0:
+            theta_step = theta + args.theta_jitter * torch.randn_like(theta)
+        nll = flow.nll_loss(theta_step, image, cond)
+        # Per-dim NLL so it is O(1), comparable to InfoNCE; lambda is then
+        # an interpretable balance, not fighting the 21k-dim summed scale.
+        loss = nll / codec.theta_dim
+        infonce = torch.zeros((), device=device)
+        if args.infonce_weight > 0:
+            # L[b, c] = log q(theta_c | image_b) over the frozen batch.
+            # Softmax over candidate thetas (columns) must pick the diagonal.
+            rows = []
+            for b in range(B):
+                ib = image[b:b + 1].expand(B, -1, -1, -1)
+                cb = cond[b:b + 1].expand(B, -1)
+                rows.append(flow.log_prob(theta_step, ib, cb))
+            L = torch.stack(rows, dim=0)  # (B, B), requires grad
+            infonce = F.cross_entropy(L / tau, targets)
+            loss = nll / codec.theta_dim + args.infonce_weight * infonce
         loss.backward()
         torch.nn.utils.clip_grad_norm_(flow.parameters(), 10.0)
         opt.step()
         losses.append(float(loss.item()))
+        nlls.append(float(nll.item()))
+        infonces.append(float(infonce.item()))
         if step % 200 == 0 or step == 1:
             print(f"  step {step:5d}/{args.steps}  nll/dim="
-                  f"{losses[-1] / codec.theta_dim:8.4f}  "
+                  f"{nlls[-1] / codec.theta_dim:8.4f}  "
+                  f"infonce={infonces[-1]:7.4f}  "
                   f"elapsed={(time.time() - t0) / 60:.1f}m")
 
     # --- Cross-assignment gate ---------------------------------------------
@@ -168,6 +213,11 @@ def run(args) -> dict:
         "diag_nll_per_dim": float(-L.diag().mean() / codec.theta_dim),
         "offdiag_nll_per_dim": float(-off / codec.theta_dim),
         "gate_passed": diagonal_wins == B,
+        # Per-sample diagnostics: distinguishes "this scene's own theta is
+        # poorly fit" (context collision) from decode-side artefacts.
+        "per_sample_diag_nll_per_dim":
+            (-L.diag() / codec.theta_dim).tolist(),
+        "log_prob_matrix_per_dim": (L / codec.theta_dim).tolist(),
     }
     print(f"[overfit] cross-assignment gate: {diagonal_wins}/{B} diagonal "
           f"wins — {'PASS' if cross['gate_passed'] else 'FAIL'} "
@@ -219,7 +269,10 @@ def run(args) -> dict:
 
     summary = {
         "cross_assignment": cross,
-        "final_nll_per_dim": losses[-1] / codec.theta_dim,
+        "final_nll_per_dim": nlls[-1] / codec.theta_dim,
+        "final_infonce": infonces[-1],
+        "infonce_weight": args.infonce_weight,
+        "infonce_temp": tau,
         "theta_dim": codec.theta_dim,
         "n_params": n_params,
         "steps": args.steps,

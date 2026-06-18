@@ -1,27 +1,23 @@
-"""Starlet (isotropic undecimated wavelet) transform and the decimated codec.
+"""Starlet (isotropic undecimated wavelet) transform and codec.
 
-The inference target for the wavelet-NPE head is theta = the decimated,
-per-scale-normalised starlet coefficients of the true sky cutout.  This
-module provides:
+The inference target for the wavelet-NPE head is theta = the
+per-scale-normalised starlet coefficients of the true sky cutout,
+kept at FULL RESOLUTION (no decimation).  This module provides:
 
 - ``starlet_transform`` / ``starlet_reconstruct``: the standard a-trous
   B3-spline starlet.  Reconstruction is exact (sum of detail planes plus
   the smooth plane), which is pinned by a unit test.
-- ``StarletCodec``: encode an image to a flat theta vector (drop sub-beam
-  planes, decimate each kept plane by a per-scale factor, asinh-compress,
-  standardise) and decode back (approximately — decimation is lossy; the
-  reconstruction error at typical source scales is pinned by tests).
+- ``StarletCodec``: encode an image to a flat theta vector (optionally
+  drop sub-beam planes, asinh-compress, standardise) and decode back.
+  All kept planes are full-resolution (H×W); the codec is lossless up
+  to the asinh round-trip on calibrated coefficients.
 
 Scale conventions
 -----------------
 Detail plane ``w_j`` (j = 1..J) carries structure at roughly ``2**(j-1)``
 to ``2**j`` px.  The beam FWHM is ~2.8 px (BEAM_SIGMA_PX = 1.4), so plane
-w_1 (~1-2 px) is sub-beam and is dropped by default per the project's
-physical constraint: sub-beam structure is PSF artefact, not morphology.
-
-Default decimation pools plane w_j by ``2**(j-1)`` (half its
-characteristic scale, i.e. roughly critical sampling) and the smooth
-plane by ``2**(J-1)``.
+w_1 (~1-2 px) is sub-beam.  ``drop_scales=(1,)`` omits it; ``drop_scales=()``
+keeps it (Option A — required for point-source peak localisation).
 """
 from __future__ import annotations
 
@@ -120,13 +116,7 @@ class StarletCodec:
     _s: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        for j in self.kept_planes():
-            f = self.pool_factor(j)
-            if self.image_size % f:
-                raise ValueError(
-                    f"image_size={self.image_size} not divisible by pool "
-                    f"factor {f} of plane {j}"
-                )
+        pass
 
     # ------------------------------------------------------------------
     # Layout
@@ -141,18 +131,13 @@ class StarletCodec:
         return kept
 
     def pool_factor(self, j: int) -> int:
-        """Decimation factor for plane j (smooth plane uses J-1)."""
-        if j == self.n_scales + 1:
-            return 2 ** (self.n_scales - 1)
-        return max(1, 2 ** (j - 1))
+        """No decimation — all planes kept at full resolution."""
+        return 1
 
     def plane_dims(self) -> list[tuple[int, int]]:
         """(side, n_elements) per kept plane, in theta order."""
-        out = []
-        for j in self.kept_planes():
-            side = self.image_size // self.pool_factor(j)
-            out.append((side, side * side))
-        return out
+        n = self.image_size * self.image_size
+        return [(self.image_size, n) for _ in self.kept_planes()]
 
     @property
     def theta_dim(self) -> int:
@@ -170,10 +155,19 @@ class StarletCodec:
         raw = self._raw_planes(images)  # list of (B, h, h)
         self._b, self._s = [], []
         for p in raw:
-            flat = p.reshape(-1)
-            mad = 1.4826 * flat.abs().median().item()
+            flat = p.reshape(p.shape[0], -1)
+            # Statistics over ACTIVE coefficients only.  Fine planes are
+            # almost all zeros (empty sky); a MAD over the full plane is
+            # dominated by them, making b tiny, z huge, and the decode
+            # z-clamp then destroys compact-source flux (pilot v2,
+            # 2026-06-11: point round-trip rel L2 ~0.99).
+            peak = flat.abs().max(dim=1).values.clamp_min(1e-12)
+            active = flat[flat.abs() > 1e-3 * peak.unsqueeze(1)]
+            if active.numel() < 16:
+                active = flat.reshape(-1)
+            mad = 1.4826 * active.abs().median().item()
             b = self.asinh_softening * max(mad, 1e-8)
-            z = torch.asinh(flat / b)
+            z = torch.asinh(active / b)
             s = max(z.std().item(), 1e-8)
             self._b.append(b)
             self._s.append(s)
@@ -207,20 +201,55 @@ class StarletCodec:
         return codec
 
     # ------------------------------------------------------------------
+    # True-sky support weights (training-loss shaping only)
+    # ------------------------------------------------------------------
+
+    def support_weights(
+        self,
+        images: torch.Tensor,
+        outside_weight: float = 0.05,
+        thresh_frac: float = 1e-3,
+    ) -> torch.Tensor:
+        """Per-dimension loss weights from the TRUE sky support.
+
+        Oracle information is safe in the loss but poison in the input:
+        these weights shape the training gradient only and are never fed
+        to the network, so nothing changes at inference.  A coefficient
+        at scale j is "inside" if any sky pixel above ``thresh_frac`` of
+        the image peak lies within the plane-j filter footprint (mask
+        dilated by radius 2**j, then max-pooled onto the decimated grid).
+        Inside dims get weight 1, outside dims ``outside_weight`` (small
+        but nonzero, so the flow still learns that empty sky is quiet).
+
+        images : (B, H, W) true skies -> (B, theta_dim) weights.
+        """
+        B = images.shape[0]
+        peak = images.abs().flatten(1).max(dim=1).values.clamp_min(1e-12)
+        mask = (images.abs() > thresh_frac * peak.view(-1, 1, 1)).float()
+        mask = mask.unsqueeze(1)  # (B, 1, H, W)
+        parts = []
+        for j in self.kept_planes():
+            scale = min(j, self.n_scales)
+            r = 2 ** scale
+            m = F.max_pool2d(mask, kernel_size=2 * r + 1, stride=1, padding=r)
+            f = self.pool_factor(j)
+            if f > 1:
+                m = F.max_pool2d(m, f)
+            parts.append(m.flatten(1))
+        w = torch.cat(parts, dim=1)  # (B, theta_dim), values in {0, 1}
+        return outside_weight + (1.0 - outside_weight) * w
+
+    # ------------------------------------------------------------------
     # Encode / decode
     # ------------------------------------------------------------------
 
     def _raw_planes(self, images: torch.Tensor) -> list[torch.Tensor]:
-        """Starlet + decimation, no normalisation. images: (B, H, W)."""
+        """Starlet planes at full resolution, no normalisation. images: (B, H, W)."""
         planes = starlet_transform(images, self.n_scales)
-        out = []
-        for j in self.kept_planes():
-            p = planes[j - 1] if j <= self.n_scales else planes[-1]
-            f = self.pool_factor(j)
-            if f > 1:
-                p = F.avg_pool2d(p.unsqueeze(1), f).squeeze(1)
-            out.append(p)
-        return out
+        return [
+            planes[j - 1] if j <= self.n_scales else planes[-1]
+            for j in self.kept_planes()
+        ]
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         """(B, H, W) true-sky images -> (B, theta_dim) theta vectors."""
@@ -234,11 +263,10 @@ class StarletCodec:
         return torch.cat(zs, dim=1)
 
     def decode(self, theta: torch.Tensor) -> torch.Tensor:
-        """(B, theta_dim) -> (B, H, W) approximate images.
+        """(B, theta_dim) -> (B, H, W) images.
 
-        Upsamples each plane bilinearly back to image_size and sums.
-        Dropped planes contribute zero.  Lossy by construction; the loss
-        is quantified in tests/test_starlet.py.
+        All planes are full-resolution so no upsampling is needed.
+        Dropped planes contribute zero.
         """
         if not self.is_calibrated:
             raise RuntimeError("StarletCodec.calibrate() must run first")
@@ -249,14 +277,8 @@ class StarletCodec:
         )
         i = 0
         for (side, n), b, s in zip(self.plane_dims(), self._b, self._s):
-            z = theta[:, i : i + n].reshape(B, 1, side, side)
+            z = theta[:, i : i + n].reshape(B, self.image_size, self.image_size)
             i += n
             z = z.clamp(-self.z_clamp, self.z_clamp)
-            p = torch.sinh(z * s) * b
-            if side != self.image_size:
-                p = F.interpolate(
-                    p, size=(self.image_size, self.image_size),
-                    mode="bilinear", align_corners=False,
-                )
-            out = out + p.squeeze(1)
+            out = out + torch.sinh(z * s) * b
         return out

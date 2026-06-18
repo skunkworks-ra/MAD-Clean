@@ -43,6 +43,7 @@ from mad_clean.data.extended_sky import (
     BEAM_SIGMA_PX,
     Target6D,
     assemble_mixed_field,
+    render_disk_ring,
     render_filament,
     render_gaussian_blob,
     render_shell,
@@ -118,7 +119,7 @@ class CutoutDataset(Dataset):
         that drift in the CLEAN loop. Default False.
     """
 
-    _ALL_MORPHS = ("point", "blob", "shell", "filament")
+    _ALL_MORPHS = ("point", "blob", "shell", "filament", "disk_ring")
 
     def __init__(
         self,
@@ -235,16 +236,45 @@ class CutoutDataset(Dataset):
         # 4. PSF
         psf, _ = self._psf_bank.sample(rng)
 
-        # Enforce minimum SNR: PSF-convolve the centred source alone and check
-        # its peak against sigma_noise. If below snr_min, rescale flux so the
-        # convolved peak just meets the threshold. This removes undetectable
-        # training examples and matches the operational range of the minor cycle
-        # (which never tries to fit sources below its stopping threshold).
+        # Enforce minimum SNR. Three gates, all linear in flux — apply the
+        # strictest required rescale.
+        #
+        # Gate 1 (existing): peak of PSF-convolved source >= snr_min * sigma.
+        # Gate 2: matched-filter SNR >= snr_min. Coherently integrates signal
+        #   across the source footprint so extended sources are judged on their
+        #   total coherent flux, not just peak surface brightness.
+        # Gate 3: every pixel in the source footprint >= 3*sigma in the dirty
+        #   image. Ensures the structure is individually visible by eye — no
+        #   invisible rings or filaments where no single pixel exceeds the noise.
         dirty_centred = fftconvolve(centred_img, psf, mode="same")
+
+        # Gate 1 — peak SNR.
         convolved_peak = float(np.abs(dirty_centred).max())
-        snr_min_threshold = self._snr_min * self._sigma_noise
-        if convolved_peak < snr_min_threshold:
-            scale = snr_min_threshold / max(convolved_peak, 1e-30)
+        scale_peak = (self._snr_min * self._sigma_noise / max(convolved_peak, 1e-30)
+                      if convolved_peak < self._snr_min * self._sigma_noise else 1.0)
+
+        # Source footprint: pixels where the PSF-convolved source reaches at
+        # least 1% of its dirty-image peak. Using dirty_centred avoids
+        # sky-plane edges that convolve to ~0, which would produce
+        # catastrophically large rescale factors from the surface-brightness gate.
+        footprint = dirty_centred > 0.01 * float(dirty_centred.max())
+
+        # Gate 2 — matched-filter SNR.
+        mf_snr = (float((dirty_centred * centred_img).sum()) /
+                  max(self._sigma_noise * math.sqrt(float((centred_img ** 2).sum())), 1e-30))
+        scale_mf = (self._snr_min / max(mf_snr, 1e-30)
+                    if mf_snr < self._snr_min else 1.0)
+
+        # Gate 3 — surface-brightness floor (3 sigma per pixel in footprint).
+        if footprint.any():
+            min_sb = float(dirty_centred[footprint].min())
+            scale_sb = (3.0 * self._sigma_noise / max(min_sb, 1e-30)
+                        if min_sb < 3.0 * self._sigma_noise else 1.0)
+        else:
+            scale_sb = 1.0
+
+        scale = max(scale_peak, scale_mf, scale_sb)
+        if scale > 1.0:
             flux = flux * scale
             centred_img = centred_img * np.float32(scale)
             centred_target = centred_target._replace(
@@ -337,6 +367,8 @@ def _render_kind(
         return render_shell(size=size, cx=cx, cy=cy, flux_jy=flux_jy, rng=rng)
     if kind == "filament":
         return render_filament(size=size, cx=cx, cy=cy, flux_jy=flux_jy, rng=rng)
+    if kind == "disk_ring":
+        return render_disk_ring(size=size, cx=cx, cy=cy, flux_jy=flux_jy, rng=rng)
     raise ValueError(f"Unknown morphology kind: {kind!r}")
 
 
