@@ -141,19 +141,13 @@ def collate(batch):
 
 
 def make_collate(codec, outside_weight, theta_jitter):
-    """Collate that encodes sky→theta and computes dim_weights on CPU workers."""
+    """Collate — stacking only; encode runs on GPU in the training loop."""
     def _collate(batch):
         res, psf, cond, sky = zip(*batch)
         img  = torch.stack([torch.stack(list(res)), torch.stack(list(psf))], dim=1)
         cond = torch.stack(list(cond))
         sky  = torch.stack(list(sky))
-        theta = codec.encode(sky)
-        if theta_jitter > 0:
-            theta = theta + theta_jitter * torch.randn_like(theta)
-        dim_w = None
-        if outside_weight < 1.0:
-            dim_w = codec.support_weights(sky, outside_weight=outside_weight)
-        return img, cond, theta, dim_w
+        return img, cond, sky
     return _collate
 
 
@@ -255,7 +249,8 @@ def run(args):
     train_collate = make_collate(codec, args.outside_weight, args.theta_jitter)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=(args.device == "cuda"),
+        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+        prefetch_factor=4 if args.num_workers > 0 else None,
         collate_fn=train_collate, persistent_workers=(args.num_workers > 0),
     )
     flow = CoeffFlow(
@@ -299,12 +294,18 @@ def run(args):
     flow.train()
 
     while step < args.steps:
-        for img, cond, theta, dim_w in train_loader:
+        for img, cond, sky in train_loader:
             if step >= args.steps:
                 break
-            img, cond, theta = img.to(device), cond.to(device), theta.to(device)
-            if dim_w is not None:
-                dim_w = dim_w.to(device)
+            img, cond = img.to(device), cond.to(device)
+            sky = sky.to(device)
+            with torch.no_grad():
+                theta = codec.encode(sky)
+                if args.theta_jitter > 0:
+                    theta = theta + args.theta_jitter * torch.randn_like(theta)
+                dim_w = None
+                if args.outside_weight < 1.0:
+                    dim_w = codec.support_weights(sky, outside_weight=args.outside_weight)
             optimizer.zero_grad()
             # NLL in per-dim units so the InfoNCE term (also per-dim scale)
             # is an interpretable balance; the summed 21k-dim NLL otherwise
