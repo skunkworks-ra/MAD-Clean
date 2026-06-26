@@ -93,8 +93,7 @@ def parse_args(argv=None):
                    help="Path to a casa_sim memmap stacks directory.  When "
                         "set, PatchCorpusDataset is used for training (and "
                         "validation if --val_stacks_dir is also set) instead "
-                        "of the synthetic CutoutDataset.  PSF bank is still "
-                        "loaded for codec calibration unless --resume is given.")
+                        "of the synthetic CutoutDataset.  PSF bank is not loaded.")
     p.add_argument("--val_stacks_dir", type=str, default=None,
                    help="Stacks dir for validation set.  Falls back to "
                         "--stacks_dir if omitted (uses same stacks).")
@@ -212,11 +211,14 @@ def run(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    print(f"[train] Loading PSF bank from {args.repo_root!r}/data/g55 ...")
-    psf_bank = load_g55_psf_bank(
-        repo_root=args.repo_root, target_size=128, rotation_augment=True,
-    )
-    print(f"[train] PSF bank size: {len(psf_bank)}")
+    if args.stacks_dir is None:
+        print(f"[train] Loading PSF bank from {args.repo_root!r}/data/g55 ...")
+        psf_bank = load_g55_psf_bank(
+            repo_root=args.repo_root, target_size=128, rotation_augment=True,
+        )
+        print(f"[train] PSF bank size: {len(psf_bank)}")
+    else:
+        psf_bank = None
 
     # --- Codec calibration (resume restores it from the checkpoint) -------
     if args.resume:
