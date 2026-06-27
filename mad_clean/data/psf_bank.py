@@ -108,6 +108,24 @@ class PSFBank:
         return self[idx]
 
 
+def load_corpus_psf_bank(
+    corpus_fits_dir: str | Path,
+    target_size: int = 128,
+    rotation_augment: bool = True,
+) -> PSFBank:
+    """Load all ``corpus_field_XXXX_psf.fits`` PSFs from a corpus directory.
+
+    These span multiple VLA configurations and frequencies, giving realistic
+    PSF diversity for SBI training.
+    """
+    d = Path(corpus_fits_dir)
+    paths = sorted(d.glob("corpus_field_*_psf.fits"))
+    if not paths:
+        raise FileNotFoundError(f"No corpus_field_*_psf.fits found in {d}")
+    return PSFBank(psf_paths=paths, target_size=target_size,
+                   rotation_augment=rotation_augment)
+
+
 def load_g55_psf_bank(
     repo_root: str | Path,
     target_size: int = 512,

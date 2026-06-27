@@ -46,6 +46,7 @@ if str(_REPO_ROOT) not in sys.path:
 import torch  # noqa: E402
 
 from mad_clean.data.cutout_dataset import CutoutDataset  # noqa: E402
+from mad_clean.data.patch_corpus_dataset import PatchCorpusDataset  # noqa: E402
 from mad_clean.data.psf_bank import load_g55_psf_bank  # noqa: E402
 from mad_clean.models.coeff_flow import CoeffFlow  # noqa: E402
 from mad_clean.wavelet.starlet import StarletCodec  # noqa: E402
@@ -65,6 +66,15 @@ def parse_args(argv=None):
     p.add_argument("--morphologies", type=str,
                    default="point,blob,shell,filament")
     p.add_argument("--extended_fraction", type=float, default=0.05)
+    p.add_argument("--stacks_dir", type=str, default=None,
+                   help="Path to PatchCorpusDataset stacks directory. When set, "
+                        "CutoutDataset is replaced by corpus patches for all "
+                        "cross-assignment and posterior tests. decisive_samples "
+                        "figure is skipped (no morphology labels in corpus).")
+    p.add_argument("--select_brightest", action="store_true",
+                   help="When using --stacks_dir, pick the n_scenes brightest "
+                        "patches by sky total flux instead of random sampling. "
+                        "Use this to ensure the posterior grid shows actual sources.")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     # Model architecture (must match the checkpoint)
@@ -91,6 +101,24 @@ def load_model(args, device):
 
 
 def make_scenes(args, psf_bank):
+    if args.stacks_dir is not None:
+        ds = PatchCorpusDataset(args.stacks_dir)
+        n = min(args.n_scenes, len(ds))
+        if args.select_brightest:
+            fluxes = [float(ds[i][3].sum()) for i in range(len(ds))]
+            indices = np.argsort(fluxes)[::-1][:n]
+            print(f"[eval] brightest {n} patches: flux range "
+                  f"[{fluxes[indices[-1]]:.4f}, {fluxes[indices[0]]:.4f}]")
+        else:
+            rng = np.random.default_rng(args.seed_offset)
+            indices = rng.choice(len(ds), size=n, replace=False)
+        res, psf_t, cond, sky = [], [], [], []
+        for i in indices:
+            r, p, c, s = ds[i]
+            res.append(r); psf_t.append(p); cond.append(c); sky.append(s)
+        img = torch.stack([torch.stack(res), torch.stack(psf_t)], dim=1)
+        return img, torch.stack(cond), torch.stack(sky)
+
     morph = {m.strip(): 1.0 for m in args.morphologies.split(",")}
     ds = CutoutDataset(
         psf_bank=psf_bank, field_size=512, cutout_size=128,
@@ -100,11 +128,11 @@ def make_scenes(args, psf_bank):
         morphology_balance=morph, return_sky=True,
         compact_subtracted=("point" not in morph),
     )
-    res, psf, cond, sky = [], [], [], []
+    res, psf_t, cond, sky = [], [], [], []
     for i in range(args.n_scenes):
         r, p, c, _, s = ds[i]
-        res.append(r); psf.append(p); cond.append(c); sky.append(s)
-    img = torch.stack([torch.stack(res), torch.stack(psf)], dim=1)
+        res.append(r); psf_t.append(p); cond.append(c); sky.append(s)
+    img = torch.stack([torch.stack(res), torch.stack(psf_t)], dim=1)
     return img, torch.stack(cond), torch.stack(sky)
 
 
@@ -301,6 +329,42 @@ def decisive_samples_figure(flow, codec, psf_bank, args, device, path,
     _decisive_panels(rows, roundtrip, median, dec, n_draws, zoom_path, crop=crop)
 
 
+def plot_convergence(log_path, out_path):
+    with open(log_path) as fh:
+        log = json.load(fh)
+    steps_tr = [x["step"] for x in log]
+    nll_tr = [x["train_nll_per_dim"] for x in log]
+    val = [x for x in log if "val_nll_per_dim" in x]
+    if not val:
+        return
+    steps_v = [x["step"] for x in val]
+    in_v  = [x["val_nll_in_support"]  for x in val]
+    out_v = [x["val_nll_out_support"] for x in val]
+    nll_v = [x["val_nll_per_dim"]     for x in val]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    ax1.plot(steps_tr, nll_tr, alpha=0.35, lw=0.8, label="train NLL/dim")
+    ax1.plot(steps_v, nll_v, "k-o", ms=3, lw=1.2, label="val NLL/dim")
+    ax1.axhline(0, color="gray", ls="--", lw=0.5)
+    ax1.set_ylabel("NLL / dim"); ax1.legend(fontsize=9)
+    ax1.set_title(f"Training convergence — {log_path.parent.name}")
+    ax1.set_ylim(-1.8, min(3, max(nll_tr[:5]) * 1.1))
+    ax2.plot(steps_v, in_v,  "b-o", ms=3, lw=1.2, label="val in-support")
+    ax2.plot(steps_v, out_v, "r-o", ms=3, lw=1.2, label="val out-support")
+    ax2.axhline(0, color="gray", ls="--", lw=0.5)
+    ax2.set_ylabel("NLL / dim"); ax2.set_xlabel("step"); ax2.legend(fontsize=9)
+    ax2.set_ylim(-1.8, min(3, max(max(in_v), max(out_v)) * 1.1))
+    best_in = min(in_v); best_step = steps_v[in_v.index(best_in)]
+    ax2.axvline(best_step, color="blue", ls=":", lw=0.8,
+                label=f"best in={best_in:.3f} @{best_step}")
+    ax2.legend(fontsize=9)
+    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
+    print(f"[eval] convergence plot -> {out_path}")
+    print(f"[eval] best val_in_support {best_in:.4f} @step {best_step}; "
+          f"final in={in_v[-1]:.4f} out={out_v[-1]:.4f} "
+          f"(sep={in_v[-1]-out_v[-1]:.4f})")
+
+
 def run(args):
     device = torch.device(args.device)
     flow, codec, step = load_model(args, device)
@@ -309,7 +373,11 @@ def run(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[eval] checkpoint step {step}; outputs in {out_dir}/")
 
-    psf_bank = load_g55_psf_bank(
+    log_path = Path(args.checkpoint).parent / "log.json"
+    if log_path.exists():
+        plot_convergence(log_path, out_dir / "convergence.png")
+
+    psf_bank = None if args.stacks_dir else load_g55_psf_bank(
         repo_root=args.repo_root, target_size=128, rotation_augment=True)
     img, cond, sky = make_scenes(args, psf_bank)
     theta = codec.encode(sky)
@@ -329,10 +397,11 @@ def run(args):
                                args.n_posterior, device,
                                out_dir / "posterior_grid.png")
 
-    decisive_samples_figure(flow, codec, psf_bank, args, device,
-                            out_dir / "decisive_samples.png")
-    print(f"[eval] decisive samples figure -> "
-          f"{out_dir / 'decisive_samples.png'}")
+    if args.stacks_dir is None:
+        decisive_samples_figure(flow, codec, psf_bank, args, device,
+                                out_dir / "decisive_samples.png")
+        print(f"[eval] decisive samples figure -> "
+              f"{out_dir / 'decisive_samples.png'}")
 
     summary = {
         "checkpoint": str(args.checkpoint),

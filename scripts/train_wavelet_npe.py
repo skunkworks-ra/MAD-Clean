@@ -26,9 +26,28 @@ from torch.utils.data import DataLoader  # noqa: E402
 
 from mad_clean.data.cutout_dataset import CutoutDataset  # noqa: E402
 from mad_clean.data.patch_corpus_dataset import PatchCorpusDataset  # noqa: E402
-from mad_clean.data.psf_bank import load_g55_psf_bank  # noqa: E402
+from mad_clean.data.psf_bank import load_g55_psf_bank, load_corpus_psf_bank  # noqa: E402
 from mad_clean.models.coeff_flow import CoeffFlow  # noqa: E402
 from mad_clean.wavelet.starlet import StarletCodec  # noqa: E402
+
+
+def _fft_convolve(sky: torch.Tensor, psf: torch.Tensor) -> torch.Tensor:
+    """PSF-convolve sky with psf, both (B, H, W), zero-padded to avoid aliasing.
+
+    Returns dirty prediction cropped back to (B, H, W).
+    """
+    B, H, W = sky.shape
+    pH, pW = psf.shape[-2], psf.shape[-1]
+    fH = H + pH - 1
+    fW = W + pW - 1
+    sky_f = torch.fft.rfft2(sky,  s=(fH, fW))
+    psf_f = torch.fft.rfft2(psf,  s=(fH, fW))
+    dirty_f = sky_f * psf_f
+    dirty_full = torch.fft.irfft2(dirty_f, s=(fH, fW))
+    # Crop to (H, W) taking the linear-convolution centre
+    y0 = (fH - H) // 2
+    x0 = (fW - W) // 2
+    return dirty_full[:, y0:y0 + H, x0:x0 + W]
 
 
 def parse_args(argv=None):
@@ -89,6 +108,14 @@ def parse_args(argv=None):
     p.add_argument("--n_layers",      type=int, default=8)
     p.add_argument("--grad_clip",     type=float, default=10.0)
     p.add_argument("--resume",        type=str, default=None)
+    p.add_argument("--corpus_psf_dir", type=str, default=None,
+                   help="Directory of corpus_field_XXXX_psf.fits files. "
+                        "When set, uses the corpus PSF bank instead of G55.")
+    p.add_argument("--residual_weight", type=float, default=0.0,
+                   help="Weight on the RESOLVE-style residual loss "
+                        "||dirty - PSF*sky_pred||^2 / sigma^2. "
+                        "0 => pure NLL (prior behaviour). "
+                        "Positive values add a differentiable forward-model term.")
     p.add_argument("--stacks_dir",    type=str, default=None,
                    help="Path to a casa_sim memmap stacks directory.  When "
                         "set, PatchCorpusDataset is used for training (and "
@@ -206,10 +233,17 @@ def run(args):
     device = torch.device(args.device)
 
     if args.stacks_dir is None:
-        print(f"[train] Loading PSF bank from {args.repo_root!r}/data/g55 ...")
-        psf_bank = load_g55_psf_bank(
-            repo_root=args.repo_root, target_size=128, rotation_augment=True,
-        )
+        if args.corpus_psf_dir is not None:
+            print(f"[train] Loading corpus PSF bank from {args.corpus_psf_dir!r} ...")
+            psf_bank = load_corpus_psf_bank(
+                corpus_fits_dir=args.corpus_psf_dir, target_size=128,
+                rotation_augment=True,
+            )
+        else:
+            print(f"[train] Loading PSF bank from {args.repo_root!r}/data/g55 ...")
+            psf_bank = load_g55_psf_bank(
+                repo_root=args.repo_root, target_size=128, rotation_augment=True,
+            )
         print(f"[train] PSF bank size: {len(psf_bank)}")
     else:
         psf_bank = None
@@ -313,12 +347,26 @@ def run(args):
             nll = flow.nll_loss(theta, img, cond, dim_weights=dim_w) / D
             loss = nll
             infonce_val = 0.0
+            residual_val = 0.0
             if args.infonce_weight > 0:
                 L = flow.log_prob_matrix(theta, img, cond)  # (B, B)
                 tgt = torch.arange(L.shape[0], device=device)
                 infonce = F.cross_entropy(L / tau, tgt)
                 loss = nll + args.infonce_weight * infonce
                 infonce_val = float(infonce.item())
+            if args.residual_weight > 0:
+                # RESOLVE-style forward model: sample sky, convolve with PSF,
+                # compare to dirty. Gradients flow back through codec.decode
+                # and the inverse coupling layers into the flow parameters.
+                theta_s = flow.sample_with_grad(img, cond, n=1).squeeze(1)  # (B, D)
+                sky_s = codec.decode(theta_s)                                # (B, H, W)
+                psf_ch = img[:, 1]                                           # (B, H, W)
+                dirty_pred = _fft_convolve(sky_s, psf_ch)
+                dirty_obs  = img[:, 0]
+                sigma = 1e-4
+                residual_loss = ((dirty_obs - dirty_pred) ** 2).mean() / (sigma ** 2)
+                loss = loss + args.residual_weight * residual_loss
+                residual_val = float(residual_loss.item())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(flow.parameters(), args.grad_clip)
             optimizer.step()
@@ -328,13 +376,15 @@ def run(args):
 
             if step % args.log_every == 0:
                 elapsed = time.time() - t0
-                total_val = nll_val + args.infonce_weight * infonce_val
+                total_val = nll_val + args.infonce_weight * infonce_val + args.residual_weight * residual_val
                 print(f"  step {step:6d}/{args.steps}  "
                       f"loss={total_val:8.4f}  nll/dim={nll_val:8.4f}  "
-                      f"infonce={infonce_val:7.4f}  elapsed={elapsed / 60:.1f}m")
+                      f"infonce={infonce_val:7.4f}  resid={residual_val:10.2f}  "
+                      f"elapsed={elapsed / 60:.1f}m")
                 log.append({"step": step, "train_loss": total_val,
                             "train_nll_per_dim": nll_val,
-                            "train_infonce": infonce_val})
+                            "train_infonce": infonce_val,
+                            "train_residual": residual_val})
 
             if step % args.val_every == 0:
                 val = eval_val(flow, val_cache, device)

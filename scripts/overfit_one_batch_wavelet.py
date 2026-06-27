@@ -31,9 +31,20 @@ import torch  # noqa: E402
 import torch.optim as optim  # noqa: E402
 
 from mad_clean.data.cutout_dataset import CutoutDataset  # noqa: E402
-from mad_clean.data.psf_bank import load_g55_psf_bank  # noqa: E402
+from mad_clean.data.psf_bank import load_g55_psf_bank, load_corpus_psf_bank  # noqa: E402
 from mad_clean.models.coeff_flow import CoeffFlow  # noqa: E402
 from mad_clean.wavelet.starlet import StarletCodec  # noqa: E402
+
+
+def _fft_convolve(sky: torch.Tensor, psf: torch.Tensor) -> torch.Tensor:
+    """Zero-padded FFT convolution, both (B, H, W). Returns (B, H, W)."""
+    B, H, W = sky.shape
+    fH, fW = H + H - 1, W + W - 1
+    sky_f = torch.fft.rfft2(sky, s=(fH, fW))
+    psf_f = torch.fft.rfft2(psf, s=(fH, fW))
+    out = torch.fft.irfft2(sky_f * psf_f, s=(fH, fW))
+    y0, x0 = (fH - H) // 2, (fW - W) // 2
+    return out[:, y0:y0 + H, x0:x0 + W]
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -48,6 +59,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--seed",      type=int, default=0)
     p.add_argument("--repo_root", type=str, default=".",
                    help="Repo root containing data/g55/chunk_*/psf.fits.")
+    p.add_argument("--corpus_psf_dir", type=str, default=None,
+                   help="Directory of corpus_field_XXXX_psf.fits. "
+                        "When set, uses corpus PSF bank instead of G55.")
+    p.add_argument("--residual_weight", type=float, default=0.0,
+                   help="Weight on RESOLVE-style residual loss. 0 => pure NLL.")
     p.add_argument("--out_dir",   type=str, default="results/overfit_wavelet")
     p.add_argument("--extended_fraction", type=float, default=0.05)
     p.add_argument("--morphologies", type=str, default="point,blob,shell,filament")
@@ -110,9 +126,16 @@ def run(args) -> dict:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    psf_bank = load_g55_psf_bank(
-        repo_root=args.repo_root, target_size=128, rotation_augment=True,
-    )
+    if args.corpus_psf_dir is not None:
+        psf_bank = load_corpus_psf_bank(
+            corpus_fits_dir=args.corpus_psf_dir, target_size=128,
+            rotation_augment=True,
+        )
+    else:
+        psf_bank = load_g55_psf_bank(
+            repo_root=args.repo_root, target_size=128, rotation_augment=True,
+        )
+    print(f"[overfit] PSF bank size: {len(psf_bank)}")
 
     # --- Codec calibration on a separate sample stream -------------------
     calib_ds = make_dataset(args, psf_bank, args.calib_samples,
@@ -151,6 +174,7 @@ def run(args) -> dict:
     losses = []
     nlls = []
     infonces = []
+    residuals = []
     B = args.n_samples
     tau = args.infonce_temp if args.infonce_temp > 0 else float(codec.theta_dim)
     targets = torch.arange(B, device=device)
@@ -167,9 +191,8 @@ def run(args) -> dict:
         # an interpretable balance, not fighting the 21k-dim summed scale.
         loss = nll / codec.theta_dim
         infonce = torch.zeros((), device=device)
+        residual_loss = torch.zeros((), device=device)
         if args.infonce_weight > 0:
-            # L[b, c] = log q(theta_c | image_b) over the frozen batch.
-            # Softmax over candidate thetas (columns) must pick the diagonal.
             rows = []
             for b in range(B):
                 ib = image[b:b + 1].expand(B, -1, -1, -1)
@@ -178,16 +201,27 @@ def run(args) -> dict:
             L = torch.stack(rows, dim=0)  # (B, B), requires grad
             infonce = F.cross_entropy(L / tau, targets)
             loss = nll / codec.theta_dim + args.infonce_weight * infonce
+        if args.residual_weight > 0:
+            theta_s = flow.sample_with_grad(image, cond, n=1).squeeze(1)
+            sky_s = codec.decode(theta_s)
+            psf_ch = image[:, 1]
+            dirty_pred = _fft_convolve(sky_s, psf_ch)
+            dirty_obs  = image[:, 0]
+            sigma = 1e-4
+            residual_loss = ((dirty_obs - dirty_pred) ** 2).mean() / (sigma ** 2)
+            loss = loss + args.residual_weight * residual_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(flow.parameters(), 10.0)
         opt.step()
         losses.append(float(loss.item()))
         nlls.append(float(nll.item()))
         infonces.append(float(infonce.item()))
+        residuals.append(float(residual_loss.item()))
         if step % 200 == 0 or step == 1:
             print(f"  step {step:5d}/{args.steps}  nll/dim="
                   f"{nlls[-1] / codec.theta_dim:8.4f}  "
                   f"infonce={infonces[-1]:7.4f}  "
+                  f"resid={residuals[-1]:10.2f}  "
                   f"elapsed={(time.time() - t0) / 60:.1f}m")
 
     # --- Cross-assignment gate ---------------------------------------------
@@ -253,6 +287,24 @@ def run(args) -> dict:
     ax.set_xlabel("step"); ax.set_ylabel("NLL / dim"); ax.set_yscale("symlog")
     fig.tight_layout(); fig.savefig(out_dir / "loss_curve.png", dpi=120)
     plt.close(fig)
+
+    # Codec round-trip: truth → theta → decode. Isolates whether failure is
+    # in the codec (can't represent) or the flow (can't predict theta).
+    roundtrip = codec.decode(codec.encode(sky.to(device))).cpu()
+    fig_rt, axes_rt = plt.subplots(B, 3, figsize=(10, 3.2 * B))
+    axes_rt = np.atleast_2d(axes_rt)
+    for b in range(B):
+        for k, (panel, title) in enumerate(zip(
+            [sky[b], roundtrip[b], sky[b] - roundtrip[b]],
+            ["true sky", "codec round-trip", "residual (truth - rt)"],
+        )):
+            im = axes_rt[b, k].imshow(panel.numpy(), origin="lower")
+            axes_rt[b, k].set_title(title if b == 0 else "")
+            axes_rt[b, k].axis("off")
+            fig_rt.colorbar(im, ax=axes_rt[b, k], fraction=0.046)
+    fig_rt.tight_layout()
+    fig_rt.savefig(out_dir / "codec_roundtrip.png", dpi=120)
+    plt.close(fig_rt)
 
     fig, axes = plt.subplots(B, 4, figsize=(13, 3.2 * B))
     axes = np.atleast_2d(axes)

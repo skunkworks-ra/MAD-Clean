@@ -262,3 +262,23 @@ class CoeffFlow(nn.Module):
         for layer in reversed(self.layers):
             z = layer.inverse(z, ctx_rep)
         return z.view(B, n, self.theta_dim)
+
+    def sample_with_grad(
+        self,
+        image: torch.Tensor,
+        cond:  torch.Tensor,
+        n: int = 1,
+    ) -> torch.Tensor:
+        """Reparameterized sample with gradients. Returns (B, n, theta_dim).
+
+        Used for residual-loss training: gradients flow back through the
+        inverse coupling layers into the flow parameters.
+        """
+        B = image.shape[0]
+        ctx = self._context(image, cond)
+        ctx_rep = ctx.repeat_interleave(n, dim=0)
+        z = torch.randn(B * n, self.theta_dim, device=image.device,
+                        dtype=ctx.dtype)
+        for layer in reversed(self.layers):
+            z = layer.inverse(z, ctx_rep)
+        return z.view(B, n, self.theta_dim)
