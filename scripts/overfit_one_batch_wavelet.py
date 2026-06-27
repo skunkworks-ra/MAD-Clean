@@ -31,9 +31,10 @@ import torch  # noqa: E402
 import torch.optim as optim  # noqa: E402
 
 from mad_clean.data.cutout_dataset import CutoutDataset  # noqa: E402
+from mad_clean.data.patch_corpus_dataset import PatchCorpusDataset  # noqa: E402
 from mad_clean.data.psf_bank import load_g55_psf_bank, load_corpus_psf_bank  # noqa: E402
 from mad_clean.models.coeff_flow import CoeffFlow  # noqa: E402
-from mad_clean.wavelet.starlet import StarletCodec  # noqa: E402
+from mad_clean.models.conv_pixel_flow import ConvPixelFlow  # noqa: E402
 
 
 def _fft_convolve(sky: torch.Tensor, psf: torch.Tensor) -> torch.Tensor:
@@ -64,6 +65,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "When set, uses corpus PSF bank instead of G55.")
     p.add_argument("--residual_weight", type=float, default=0.0,
                    help="Weight on RESOLVE-style residual loss. 0 => pure NLL.")
+    p.add_argument("--l1_outside_weight", type=float, default=0.0,
+                   help="Weight on L1 penalty for predicted sky outside the "
+                        "truth footprint mask. Computed from sky_truth > 1%% "
+                        "of sky_truth.max() per sample.")
+    p.add_argument("--stacks_dir", type=str, default=None,
+                   help="Path to PatchCorpusDataset stacks directory. When set, "
+                        "loads the N brightest patches by sky flux instead of "
+                        "generating synthetic cutouts.")
     p.add_argument("--out_dir",   type=str, default="results/overfit_wavelet")
     p.add_argument("--extended_fraction", type=float, default=0.05)
     p.add_argument("--morphologies", type=str, default="point,blob,shell,filament")
@@ -85,6 +94,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     # that puts the same (marginal-mean) mass on every scene; the softmax
     # over candidate thetas does, by normalising across alternatives.  This
     # is the cross-assignment gate turned into a training signal.
+    p.add_argument("--sky_weight", action="store_true", default=True,
+                   help="Weight NLL per pixel by true sky value (normalised per "
+                        "sample). Suppresses background-pixel dominance.")
+    p.add_argument("--no_sky_weight", dest="sky_weight", action="store_false")
+    p.add_argument("--sky_weight_floor", type=float, default=0.1,
+                   help="Additive floor on sky weights before normalisation. "
+                        "Keeps background pixels in the loss (prevents "
+                        "conditioning collapse) while still upweighting sources.")
+    p.add_argument("--sparsity_weight", type=float, default=0.0,
+                   help="Weight on L1 sparsity prior applied to posterior samples. "
+                        "Pushes background pixels toward zero; sky-weighted NLL "
+                        "opposes it at source pixels. Use sample_with_grad.")
     p.add_argument("--infonce_weight", type=float, default=0.0,
                    help="Weight lambda on the InfoNCE term. 0 => pure NLL "
                         "(reproduces prior behaviour).")
@@ -93,10 +114,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "0 => divide by theta_dim (per-dim logits, O(1) "
                         "scale); otherwise logits are divided by tau.")
     # Model size (defaults match the planned full run)
-    p.add_argument("--base_channels", type=int, default=32)
-    p.add_argument("--context_dim",   type=int, default=256)
-    p.add_argument("--hidden",        type=int, default=128)
-    p.add_argument("--n_layers",      type=int, default=8)
+    p.add_argument("--base_channels",     type=int, default=32)
+    p.add_argument("--context_dim",       type=int, default=256)
+    p.add_argument("--hidden",            type=int, default=128)
+    p.add_argument("--n_layers",          type=int, default=8)
+    p.add_argument("--conv_flow",         action="store_true", default=False,
+                   help="Use ConvPixelFlow (CNN coupling + checkerboard masks) "
+                        "instead of CoeffFlow (MLP coupling + random masks).")
+    p.add_argument("--coupling_channels", type=int, default=32,
+                   help="Channels inside each ConvPixelFlow coupling CNN.")
     return p.parse_args(argv)
 
 
@@ -126,57 +152,88 @@ def run(args) -> dict:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.corpus_psf_dir is not None:
-        psf_bank = load_corpus_psf_bank(
-            corpus_fits_dir=args.corpus_psf_dir, target_size=128,
-            rotation_augment=True,
-        )
+    if args.stacks_dir is not None:
+        # Load the N brightest patches from a real corpus stacks directory.
+        print(f"[overfit] Loading real patches from {args.stacks_dir!r} ...")
+        corpus_ds = PatchCorpusDataset(args.stacks_dir)
+        sky_flux = np.array([
+            corpus_ds[i][3].sum().item() for i in range(len(corpus_ds))
+        ])
+        top_idx = np.argsort(sky_flux)[::-1][:args.n_samples]
+        print(f"[overfit] Selected patch indices: {top_idx.tolist()}")
+        print(f"[overfit] Sky fluxes: {sky_flux[top_idx].tolist()}")
+        res_list, psf_list, cond_list, sky_list = [], [], [], []
+        for i in top_idx:
+            r, p, c, s = corpus_ds[i]
+            res_list.append(r); psf_list.append(p)
+            cond_list.append(c); sky_list.append(s)
     else:
-        psf_bank = load_g55_psf_bank(
-            repo_root=args.repo_root, target_size=128, rotation_augment=True,
-        )
-    print(f"[overfit] PSF bank size: {len(psf_bank)}")
+        if args.corpus_psf_dir is not None:
+            psf_bank = load_corpus_psf_bank(
+                corpus_fits_dir=args.corpus_psf_dir, target_size=128,
+                rotation_augment=True,
+            )
+        else:
+            psf_bank = load_g55_psf_bank(
+                repo_root=args.repo_root, target_size=128, rotation_augment=True,
+            )
+        print(f"[overfit] PSF bank size: {len(psf_bank)}")
+        ds = make_dataset(args, psf_bank, args.n_samples)
+        res_list, psf_list, cond_list, sky_list = [], [], [], []
+        for i in range(args.n_samples):
+            r, p, c, _, s = ds[i]
+            res_list.append(r); psf_list.append(p)
+            cond_list.append(c); sky_list.append(s)
 
-    # --- Codec calibration on a separate sample stream -------------------
-    calib_ds = make_dataset(args, psf_bank, args.calib_samples,
-                            seed_offset=1_000_000)
-    calib_skies = torch.stack(
-        [calib_ds[i][4] for i in range(args.calib_samples)]
-    )
-    drops = tuple(int(x) for x in args.drop_scales.split(",") if x.strip())
-    codec = StarletCodec(image_size=128, drop_scales=drops)
-    codec.calibrate(calib_skies)
-    print(f"[overfit] codec theta_dim = {codec.theta_dim}")
-
-    # --- Frozen batch -----------------------------------------------------
-    ds = make_dataset(args, psf_bank, args.n_samples)
-    res, psf, cond, sky = [], [], [], []
-    for i in range(args.n_samples):
-        r, p, c, _, s = ds[i]
-        res.append(r); psf.append(p); cond.append(c); sky.append(s)
-    image = torch.stack([torch.stack(res), torch.stack(psf)], dim=1).to(device)
-    cond  = torch.stack(cond).to(device)
-    sky   = torch.stack(sky)
-    theta = codec.encode(sky).to(device)
+    # --- Pixel-space target -----------------------------------------------
+    # No codec. Flow operates directly on flattened sky pixels.
+    # Normalise by per-batch sky peak so the flow sees O(1) targets
+    # regardless of absolute flux level. Scale is stored for decode.
+    image = torch.stack([torch.stack(res_list), torch.stack(psf_list)], dim=1).to(device)
+    cond  = torch.stack(cond_list).to(device)
+    sky   = torch.stack(sky_list)           # (B, 128, 128)
+    sky_scale = sky.abs().max().clamp_min(1e-12)
+    theta = (sky / sky_scale).flatten(1).to(device)   # (B, 16384)
+    THETA_DIM = 128 * 128
+    print(f"[overfit] pixel-space theta_dim = {THETA_DIM}  sky_scale = {sky_scale:.4e}")
 
     # --- Model and training ------------------------------------------------
-    flow = CoeffFlow(
-        theta_dim=codec.theta_dim,
-        base_channels=args.base_channels,
-        context_dim=args.context_dim,
-        hidden=args.hidden,
-        n_layers=args.n_layers,
-    ).to(device)
+    if args.conv_flow:
+        flow = ConvPixelFlow(
+            image_size=128,
+            base_channels=args.base_channels,
+            context_dim=args.context_dim,
+            coupling_channels=args.coupling_channels,
+            n_layers=args.n_layers,
+        ).to(device)
+    else:
+        flow = CoeffFlow(
+            theta_dim=THETA_DIM,
+            base_channels=args.base_channels,
+            context_dim=args.context_dim,
+            hidden=args.hidden,
+            n_layers=args.n_layers,
+        ).to(device)
     n_params = sum(p.numel() for p in flow.parameters())
     print(f"[overfit] model parameters: {n_params:,}")
+
+    # Precompute truth footprint mask per sample: sky > 1% of sky.max().
+    # Used for the L1 outside-footprint penalty during training.
+    # Shape (B, H, W), on device, computed from truth sky not the prediction.
+    sky_dev = sky.to(device)
+    # Noise-aware footprint: sky > 3 * MAD(sky), not a fraction of peak.
+    # Fraction-of-peak collapses to noise for faint extended sources.
+    sky_mad = 1.4826 * sky_dev.flatten(1).median(dim=1).values.abs().clamp_min(1e-12)
+    footprint = sky_dev > 3.0 * sky_mad.view(-1, 1, 1)
 
     opt = optim.Adam(flow.parameters(), lr=args.lr, foreach=False)
     losses = []
     nlls = []
     infonces = []
     residuals = []
+    l1_outsides = []
     B = args.n_samples
-    tau = args.infonce_temp if args.infonce_temp > 0 else float(codec.theta_dim)
+    tau = args.infonce_temp if args.infonce_temp > 0 else float(THETA_DIM)
     targets = torch.arange(B, device=device)
     t0 = time.time()
     flow.train()
@@ -186,10 +243,20 @@ def run(args) -> dict:
         theta_step = theta
         if args.theta_jitter > 0:
             theta_step = theta + args.theta_jitter * torch.randn_like(theta)
-        nll = flow.nll_loss(theta_step, image, cond)
+        if args.sky_weight:
+            # Sky-value weighting: bright source pixels dominate the NLL;
+            # near-zero background pixels get near-zero weight so the flow
+            # cannot satisfy the loss by outputting zeros everywhere.
+            # Weights are normalised per sample so the total loss magnitude
+            # is unchanged (mean weight = 1).
+            sky_w = args.sky_weight_floor + theta.clamp(min=0)
+            sky_w = sky_w / sky_w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+            nll = -flow.log_prob(theta_step, image, cond, dim_weights=sky_w).mean()
+        else:
+            nll = flow.nll_loss(theta_step, image, cond)
         # Per-dim NLL so it is O(1), comparable to InfoNCE; lambda is then
         # an interpretable balance, not fighting the 21k-dim summed scale.
-        loss = nll / codec.theta_dim
+        loss = nll / THETA_DIM
         infonce = torch.zeros((), device=device)
         residual_loss = torch.zeros((), device=device)
         if args.infonce_weight > 0:
@@ -200,16 +267,33 @@ def run(args) -> dict:
                 rows.append(flow.log_prob(theta_step, ib, cb))
             L = torch.stack(rows, dim=0)  # (B, B), requires grad
             infonce = F.cross_entropy(L / tau, targets)
-            loss = nll / codec.theta_dim + args.infonce_weight * infonce
-        if args.residual_weight > 0:
+            loss = nll / THETA_DIM + args.infonce_weight * infonce
+        sparsity_loss = torch.zeros((), device=device)
+        l1_outside = torch.zeros((), device=device)
+        if args.sparsity_weight > 0 or args.residual_weight > 0 or args.l1_outside_weight > 0:
             theta_s = flow.sample_with_grad(image, cond, n=1).squeeze(1)
-            sky_s = codec.decode(theta_s)
-            psf_ch = image[:, 1]
-            dirty_pred = _fft_convolve(sky_s, psf_ch)
-            dirty_obs  = image[:, 0]
-            sigma = 1e-4
-            residual_loss = ((dirty_obs - dirty_pred) ** 2).mean() / (sigma ** 2)
-            loss = loss + args.residual_weight * residual_loss
+            sky_s = theta_s.reshape(-1, 128, 128) * sky_scale.to(device)
+            if args.residual_weight > 0:
+                psf_ch = image[:, 1]
+                dirty_pred = _fft_convolve(sky_s, psf_ch)
+                dirty_obs  = image[:, 0]
+                sigma = 1e-4
+                residual_loss = ((dirty_obs - dirty_pred) ** 2).mean() / (sigma ** 2)
+                loss = loss + args.residual_weight * residual_loss
+            if args.sparsity_weight > 0:
+                # L1 on all predicted pixels: sparse prior on the sky.
+                # Sky-weighted NLL opposes this at source pixels (large sky_w
+                # gradient); at background pixels sky_w ~ floor so L1 wins
+                # and drives them toward zero.
+                sparsity_loss = sky_s.abs().mean()
+                loss = loss + args.sparsity_weight * sparsity_loss
+            if args.l1_outside_weight > 0:
+                # Penalise any predicted flux outside the truth source footprint.
+                # sky_s.clamp(min=0) because the flow can predict negative values
+                # which are unphysical; we only want to penalise positive outside flux.
+                outside_flux = sky_s.clamp(min=0)[~footprint]
+                l1_outside = outside_flux.mean()
+                loss = loss + args.l1_outside_weight * l1_outside
         loss.backward()
         torch.nn.utils.clip_grad_norm_(flow.parameters(), 10.0)
         opt.step()
@@ -217,11 +301,14 @@ def run(args) -> dict:
         nlls.append(float(nll.item()))
         infonces.append(float(infonce.item()))
         residuals.append(float(residual_loss.item()))
+        l1_outsides.append(float(l1_outside.item()))
         if step % 200 == 0 or step == 1:
             print(f"  step {step:5d}/{args.steps}  nll/dim="
-                  f"{nlls[-1] / codec.theta_dim:8.4f}  "
+                  f"{nlls[-1] / THETA_DIM:8.4f}  "
                   f"infonce={infonces[-1]:7.4f}  "
                   f"resid={residuals[-1]:10.2f}  "
+                  f"sparse={float(sparsity_loss.item()):.4e}  "
+                  f"l1_out={l1_outsides[-1]:.4e}  "
                   f"elapsed={(time.time() - t0) / 60:.1f}m")
 
     # --- Cross-assignment gate ---------------------------------------------
@@ -244,14 +331,14 @@ def run(args) -> dict:
         "ranks": ranks,
         "diagonal_wins": diagonal_wins,
         "n_samples": B,
-        "diag_nll_per_dim": float(-L.diag().mean() / codec.theta_dim),
-        "offdiag_nll_per_dim": float(-off / codec.theta_dim),
+        "diag_nll_per_dim": float(-L.diag().mean() / THETA_DIM),
+        "offdiag_nll_per_dim": float(-off / THETA_DIM),
         "gate_passed": diagonal_wins == B,
         # Per-sample diagnostics: distinguishes "this scene's own theta is
         # poorly fit" (context collision) from decode-side artefacts.
         "per_sample_diag_nll_per_dim":
-            (-L.diag() / codec.theta_dim).tolist(),
-        "log_prob_matrix_per_dim": (L / codec.theta_dim).tolist(),
+            (-L.diag() / THETA_DIM).tolist(),
+        "log_prob_matrix_per_dim": (L / THETA_DIM).tolist(),
     }
     print(f"[overfit] cross-assignment gate: {diagonal_wins}/{B} diagonal "
           f"wins — {'PASS' if cross['gate_passed'] else 'FAIL'} "
@@ -261,7 +348,7 @@ def run(args) -> dict:
     # --- Posterior reconstruction diagnostics ------------------------------
     samples = flow.sample(image, cond, n=args.n_posterior)  # (B, n, D)
     B, n, D = samples.shape
-    dec = codec.decode(samples.reshape(B * n, D).cpu()).reshape(B, n, 128, 128)
+    dec = (samples.reshape(B * n, D).cpu() * sky_scale).reshape(B, n, 128, 128)
     # Median, not mean: the sinh decode amplifies posterior tail samples
     # exponentially, so the pixelwise mean is dominated by outliers.
     post_med = dec.median(dim=1).values
@@ -283,14 +370,14 @@ def run(args) -> dict:
 
     # --- Plots --------------------------------------------------------------
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(np.array(losses) / codec.theta_dim)
+    ax.plot(np.array(losses) / THETA_DIM)
     ax.set_xlabel("step"); ax.set_ylabel("NLL / dim"); ax.set_yscale("symlog")
     fig.tight_layout(); fig.savefig(out_dir / "loss_curve.png", dpi=120)
     plt.close(fig)
 
     # Codec round-trip: truth → theta → decode. Isolates whether failure is
     # in the codec (can't represent) or the flow (can't predict theta).
-    roundtrip = codec.decode(codec.encode(sky.to(device))).cpu()
+    roundtrip = sky  # pixel basis: encode/decode is identity
     fig_rt, axes_rt = plt.subplots(B, 3, figsize=(10, 3.2 * B))
     axes_rt = np.atleast_2d(axes_rt)
     for b in range(B):
@@ -306,30 +393,55 @@ def run(args) -> dict:
     fig_rt.savefig(out_dir / "codec_roundtrip.png", dpi=120)
     plt.close(fig_rt)
 
+    from matplotlib.colors import TwoSlopeNorm  # noqa: E402
+    import matplotlib.ticker as ticker  # noqa: E402
+
+    def _sym_norm(arr):
+        v = float(np.abs(arr).max()) or 1.0
+        return TwoSlopeNorm(vmin=-v, vcenter=0, vmax=v)
+
+    def _pos_norm(arr):
+        v = float(np.abs(arr).max()) or 1.0
+        return plt.Normalize(vmin=0, vmax=v)
+
     fig, axes = plt.subplots(B, 4, figsize=(13, 3.2 * B))
     axes = np.atleast_2d(axes)
-    titles = ["residual", "true sky", "posterior median", "posterior std"]
+    col_titles = ["dirty (input)", "true sky", "posterior median", "posterior std"]
     for b in range(B):
-        panels = [image[b, 0].cpu(), sky[b], post_med[b], post_std[b]]
-        for k, (panel, title) in enumerate(zip(panels, titles)):
-            im = axes[b, k].imshow(panel.numpy(), origin="lower")
-            axes[b, k].set_title(title if b == 0 else "")
+        dirty_np = image[b, 0].cpu().numpy()
+        sky_np   = sky[b].numpy()
+        med_np   = post_med[b].numpy()
+        std_np   = post_std[b].numpy()
+        panels = [
+            (dirty_np, "RdBu_r",  _sym_norm(dirty_np)),
+            (sky_np,   "inferno", _pos_norm(sky_np)),
+            (med_np,   "inferno", _pos_norm(sky_np)),   # same scale as truth
+            (std_np,   "inferno", _pos_norm(std_np)),
+        ]
+        for k, (panel, cmap, norm) in enumerate(panels):
+            im = axes[b, k].imshow(panel, origin="lower", cmap=cmap, norm=norm,
+                                   interpolation="nearest")
+            if b == 0:
+                axes[b, k].set_title(col_titles[k], fontsize=8)
             axes[b, k].axis("off")
-            fig.colorbar(im, ax=axes[b, k], fraction=0.046)
-    fig.tight_layout(); fig.savefig(out_dir / "recon_grid.png", dpi=120)
+            cb = fig.colorbar(im, ax=axes[b, k], fraction=0.046, pad=0.02)
+            cb.ax.tick_params(labelsize=6)
+            cb.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2g"))
+    fig.tight_layout()
+    fig.savefig(out_dir / "recon_grid.png", dpi=130)
     plt.close(fig)
 
     summary = {
         "cross_assignment": cross,
-        "final_nll_per_dim": nlls[-1] / codec.theta_dim,
+        "final_nll_per_dim": nlls[-1] / THETA_DIM,
         "final_infonce": infonces[-1],
         "infonce_weight": args.infonce_weight,
         "infonce_temp": tau,
-        "theta_dim": codec.theta_dim,
+        "theta_dim": THETA_DIM,
+        "sky_scale": float(sky_scale),
         "n_params": n_params,
         "steps": args.steps,
         "per_sample": per_sample,
-        "codec": codec.state_dict(),
     }
     with open(out_dir / "summary.json", "w") as fh:
         json.dump(summary, fh, indent=2)
