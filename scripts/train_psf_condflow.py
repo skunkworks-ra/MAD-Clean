@@ -1,22 +1,26 @@
 """Train PSFCondFlow: conditional flow matching for single-source islands.
 
-Infinite on-the-fly corpus: single source per patch (50% point, 30% compact
-Gaussian, 20% arc), no diffuse background, simulated dirty image via the G55
-PSF bank.  Loss is pixel-weighted CFM MSE (source pixels up-weighted by
-lambda=10 to avoid floor domination from the zero-sky background).
+Infinite on-the-fly corpus: single source per patch (50% point, 30% Gaussian
+spanning compact-to-extended, 20% arc), NO rings, no diffuse background.
+Carries both 2026-06-28 fixes: spatial conditioning (dirty+PSF concatenated to
+x_t, built into PSFCondFlow) and asinh target space (--asinh_a, validated to
+recover extended dynamic range).  Loss is pixel-weighted CFM MSE.
 
 GPU required.
 
-Example
--------
+Example (general deconvolution over a corpus PSF bank)
+------------------------------------------------------
     pixi run -e gpu python scripts/train_psf_condflow.py \\
-        --out models/psf_condflow.pt --steps 100000 --batch_size 16
+        --out models/psf_condflow.pt --steps 100000 --batch_size 16 \\
+        --asinh_a 1e-2 --psf_npy /path/to/corpus_stacks/train/psf.npy
 
-Held-out eval after training:
+Omit --psf_npy to use the in-repo G55 bank.
+
+Held-out eval after training (restores asinh_a from the checkpoint):
     pixi run -e gpu python scripts/overfit_psf_condflow.py \\
         --ckpt models/psf_condflow.pt --morphology points --device cuda
     pixi run -e gpu python scripts/overfit_psf_condflow.py \\
-        --ckpt models/psf_condflow.pt --morphology extended --device cuda
+        --ckpt models/psf_condflow.pt --morphology gaussian --device cuda
 """
 from __future__ import annotations
 
@@ -36,7 +40,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from scipy.ndimage import gaussian_filter
 
 from mad_clean.data.field_sky import assemble_corpus_field
-from mad_clean.data.psf_bank import load_g55_psf_bank
+from mad_clean.data.psf_bank import load_g55_psf_bank, load_psf_bank_from_npy
 from mad_clean.imaging.forward import ImageDomainForward
 from mad_clean.models.mdn_asp import COND_DIM
 from mad_clean.models.psf_condflow import PSFCondFlow, cfm_loss
@@ -55,26 +59,28 @@ def _sample_source(size, rng, morph_probs=(0.5, 0.3, 0.2)):
     morph = rng.choice(["point", "compact", "arc"], p=morph_probs)
 
     if morph == "point":
-        sky, _ = assemble_corpus_field(
+        sky = assemble_corpus_field(
             size=size, include_diffuse=False,
             n_points=(1, 1), point_flux_range_jy=(1e-2, 1e0),
             n_ridges=(0, 0), rng=rng,
         )
 
     elif morph == "compact":
-        sky, _ = assemble_corpus_field(
+        sky = assemble_corpus_field(
             size=size, include_diffuse=False,
             n_points=(1, 1), point_flux_range_jy=(1e-2, 1e0),
             n_ridges=(0, 0), rng=rng,
         )
         total = float(sky.sum())
-        sigma = float(rng.uniform(0.5, 2.5))
+        # Span compact-to-extended Gaussians (sub-beam to large blob) so the
+        # model sees the extended regime validated in the asinh overfit test.
+        sigma = float(rng.uniform(1.0, 16.0))
         sky = gaussian_filter(sky.astype(np.float64), sigma=sigma).astype(np.float32)
         if sky.sum() > 1e-12:
             sky = sky * (total / sky.sum())
 
     else:  # arc
-        sky, _ = assemble_corpus_field(
+        sky = assemble_corpus_field(
             size=size, include_diffuse=False,
             n_points=(0, 0), n_ridges=(1, 1),
             ridge_flux_range_jy=(5e-2, 5e-1), rng=rng,
@@ -97,18 +103,25 @@ class _SingleSourceStream(IterableDataset):
         repo_root: Path,
         snr_range: tuple[float, float],
         morph_probs: tuple[float, float, float],
+        psf_npy: str | None = None,
     ):
         self.size = size
         self.base_seed = base_seed
         self.repo_root = repo_root
         self.snr_range = snr_range
         self.morph_probs = morph_probs
+        self.psf_npy = psf_npy
 
     def __iter__(self):
         info = get_worker_info()
         wid = 0 if info is None else info.id
         rng = np.random.default_rng(self.base_seed + wid)
-        bank = load_g55_psf_bank(repo_root=self.repo_root, target_size=self.size)
+        # Corpus PSF bank (--psf_npy) for general deconvolution across PSFs;
+        # falls back to the in-repo G55 bank when not supplied.
+        if self.psf_npy is not None:
+            bank = load_psf_bank_from_npy(self.psf_npy, target_size=self.size)
+        else:
+            bank = load_g55_psf_bank(repo_root=self.repo_root, target_size=self.size)
 
         while True:
             sky = _sample_source(self.size, rng, self.morph_probs)
@@ -142,6 +155,12 @@ def parse_args(argv=None):
     p.add_argument("--base_channels", type=int, default=32)
     p.add_argument("--pw_lambda",   type=float, default=10.0,
                    help="Pixel-weight lambda for source pixels in the CFM loss.")
+    p.add_argument("--asinh_a",     type=float, default=1e-2,
+                   help="asinh target-space softening (validated extended fix). "
+                        "Set near the normalised noise level. 0 => linear space.")
+    p.add_argument("--psf_npy",     type=str,   default=None,
+                   help="Corpus PSF stack (N_fields,H,W).npy for general "
+                        "deconvolution. Omit to use the in-repo G55 bank.")
     p.add_argument("--snr_min",     type=float, default=5.0)
     p.add_argument("--snr_max",     type=float, default=100.0)
     p.add_argument("--ema_decay",   type=float, default=0.9999)
@@ -166,11 +185,12 @@ def main(argv=None):
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model = PSFCondFlow(base=args.base_channels).to(device)
+    model = PSFCondFlow(base=args.base_channels, asinh_a=args.asinh_a).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"PSFCondFlow  base={args.base_channels}  params={n_params:,}")
     print(f"size={args.size}  batch={args.batch_size}  steps={args.steps}  "
-          f"pw_lambda={args.pw_lambda}  device={device}")
+          f"pw_lambda={args.pw_lambda}  asinh_a={args.asinh_a}  "
+          f"psf={'corpus:' + args.psf_npy if args.psf_npy else 'g55'}  device={device}")
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -185,6 +205,7 @@ def main(argv=None):
                     "base_channels": args.base_channels,
                     "size": args.size,
                     "pw_lambda": args.pw_lambda,
+                    "asinh_a": args.asinh_a,
                 },
             },
             out_path,
@@ -196,6 +217,7 @@ def main(argv=None):
         repo_root=_REPO_ROOT,
         snr_range=(args.snr_min, args.snr_max),
         morph_probs=(0.5, 0.3, 0.2),
+        psf_npy=args.psf_npy,
     )
     loader = DataLoader(
         ds,

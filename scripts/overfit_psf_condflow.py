@@ -47,7 +47,8 @@ from mad_clean.models.psf_condflow import PSFCondFlow, cfm_loss
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="PSFCondFlow overfit gate.")
     p.add_argument("--size",      type=int,   default=128)
-    p.add_argument("--morphology", choices=["points", "extended"], default="points")
+    p.add_argument("--morphology", choices=["points", "extended", "gaussian"],
+                   default="points")
     p.add_argument("--n_patches", type=int,   default=8)
     p.add_argument("--steps",     type=int,   default=2000)
     p.add_argument("--base_channels", type=int, default=32)
@@ -58,6 +59,10 @@ def parse_args(argv=None):
     p.add_argument("--n_samples", type=int,   default=8)
     p.add_argument("--n_steps",   type=int,   default=50,
                    help="ODE integration steps at inference.")
+    p.add_argument("--asinh_a",   type=float, default=0.0,
+                   help="If >0, transport the flow in asinh-compressed space "
+                        "y=asinh(s/a)/asinh(1/a) so brightness decades are "
+                        "resolved. Set near the normalised noise level. 0=linear.")
     p.add_argument("--ckpt",      type=str,   default="",
                    help="Load a trained checkpoint instead of overfitting.")
     p.add_argument("--device",    type=str,
@@ -96,6 +101,25 @@ def _single_ridge_patch(size, rng, flux_range=(5e-2, 5e-1), edge_margin=16):
     return sky.astype(np.float32), ridge.astype(np.float32)
 
 
+def _single_gaussian_patch(size, rng, peak_range=(1e-1, 5e-1),
+                           sigma_range=(12.0, 20.0), edge_margin=28):
+    """One large, smooth, peak-normalised 2D Gaussian blob.
+
+    The cleanest extended source: single-peaked, smooth, big spatial extent,
+    a continuous center-to-edge brightness ramp.  If the flow cannot reproduce
+    this on overfit it cannot do extended emission at all.
+    """
+    cy = rng.integers(edge_margin, size - edge_margin)
+    cx = rng.integers(edge_margin, size - edge_margin)
+    sy = rng.uniform(*sigma_range)
+    sx = rng.uniform(*sigma_range)
+    yy, xx = np.mgrid[0:size, 0:size]
+    g = np.exp(-(((yy - cy) ** 2) / (2 * sy ** 2)
+                 + ((xx - cx) ** 2) / (2 * sx ** 2)))
+    g = (g * rng.uniform(*peak_range)).astype(np.float32)   # peak ∈ peak_range
+    return g, g.copy()
+
+
 def make_patches(n, size, seed, morphology):
     rng = np.random.default_rng(seed)
     skies, catalogs, ridges = [], [], []
@@ -105,6 +129,11 @@ def make_patches(n, size, seed, morphology):
             skies.append(sky)
             catalogs.append(cat)
             ridges.append(np.zeros((size, size), dtype=np.float32))
+        elif morphology == "gaussian":
+            sky, blob = _single_gaussian_patch(size, rng)
+            skies.append(sky)
+            catalogs.append([])
+            ridges.append(blob)
         else:
             sky, ridge = _single_ridge_patch(size, rng)
             skies.append(sky)
@@ -149,10 +178,11 @@ def _zero_cond(B, device, dtype):
 # Overfit
 # ---------------------------------------------------------------------------
 
-def overfit(s0_batch, d_batch, psf_batch, sigma_n, steps, base, lr, pw_lambda, device, seed):
+def overfit(s0_batch, d_batch, psf_batch, sigma_n, steps, base, lr, pw_lambda,
+            device, seed, asinh_a=0.0):
     """Overfit PSFCondFlow on a small fixed batch of (s0, d, psf) pairs."""
     torch.manual_seed(seed)
-    model = PSFCondFlow(base=base).to(device)
+    model = PSFCondFlow(base=base, asinh_a=asinh_a).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     gen = torch.Generator(device=device).manual_seed(seed)
 
@@ -207,7 +237,11 @@ def main(argv=None):
 
     if args.ckpt:
         ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-        model = PSFCondFlow(base=ckpt["config"]["base_channels"]).to(device)
+        cfg = ckpt["config"]
+        model = PSFCondFlow(
+            base=cfg["base_channels"],
+            asinh_a=cfg.get("asinh_a", 0.0),   # restore target space; old ckpts=linear
+        ).to(device)
         model.load_state_dict(ckpt.get("ema", ckpt["model"]))
         model.eval()
         print(f"\n[held-out eval] {args.ckpt}  step={ckpt.get('step','?')}")
@@ -215,7 +249,8 @@ def main(argv=None):
         print(f"\n[overfit] {args.steps} steps  pw_lambda={args.pw_lambda}  sigma_n={sigma_n:.3e}")
         model = overfit(
             s_torch, d_batch, psf_batch, sigma_n,
-            args.steps, args.base_channels, args.lr, args.pw_lambda, device, args.seed + 1,
+            args.steps, args.base_channels, args.lr, args.pw_lambda, device,
+            args.seed + 1, asinh_a=args.asinh_a,
         )
 
     # ── reconstruct patch 0 ───────────────────────────────────────────────────
@@ -264,8 +299,8 @@ def main(argv=None):
         print(f"  {'posterior':10s} {fr:10.2f} {rl:8.2f} {cr:6.2f}")
         ext_pass = (0.3 <= fr <= 3.0) and (cr >= 0.6)
 
-    verdict = ext_pass if args.morphology == "extended" else point_pass
-    label = "arc" if args.morphology == "extended" else "sources"
+    verdict = ext_pass if args.morphology in ("extended", "gaussian") else point_pass
+    label = "extended" if args.morphology in ("extended", "gaussian") else "sources"
     if verdict is None:
         print(f"\n  → no {label} to score")
     elif verdict:

@@ -103,6 +103,7 @@ class _VelocityUNet(UNet):
         mults: tuple[int, ...] = (1, 2, 2, 4),
         emb_dim: int = 128,
         ctx_dim: int = 256,
+        cond_ch: int = 2,
     ):
         super().__init__(in_ch=1, base=base, mults=mults, emb_dim=emb_dim)
         # Replace emb_mlp: input is now (sin_emb || ctx)
@@ -111,18 +112,28 @@ class _VelocityUNet(UNet):
             nn.SiLU(),
             nn.Linear(emb_dim, emb_dim),
         )
+        # Spatially-resolved conditioning: concatenate the (normalised dirty,
+        # PSF) maps to x_t so the conv net sees WHERE the source is.  Without
+        # this the only spatial input is i.i.d. noise and a translation-
+        # equivariant UNet can only emit a stationary (uniform) field — the
+        # uniform-field overfit failure (2026-06-28).  out_conv stays 1-ch
+        # (parent built it from in_ch=1); we only widen the input stem.
+        self.in_conv = nn.Conv2d(1 + cond_ch, self.in_conv.out_channels,
+                                 3, padding=1)
 
     def forward(  # type: ignore[override]
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         ctx: torch.Tensor,
+        cond_maps: torch.Tensor,
     ) -> torch.Tensor:
-        """x (B,1,H,W), t (B,) ∈ [0,1], ctx (B, ctx_dim) → velocity (B,1,H,W)."""
+        """x (B,1,H,W), t (B,), ctx (B,ctx_dim), cond_maps (B,cond_ch,H,W)
+        → velocity (B,1,H,W)."""
         t_emb = _sinusoidal_embedding(t.float(), self.emb_dim)     # (B, emb_dim)
         combined = torch.cat([t_emb, ctx], dim=-1)                  # (B, emb_dim+ctx_dim)
         emb = self.emb_mlp(combined)                                # (B, emb_dim)
-        h = self.in_conv(x)
+        h = self.in_conv(torch.cat([x, cond_maps], dim=1))
         skips = []
         for block, down in zip(self.down_blocks, self.downsample):
             h = block(h, emb)
@@ -159,11 +170,30 @@ class PSFCondFlow(nn.Module):
         emb_dim: int = 128,
         ctx_dim: int = 256,
         cond_dim: int = COND_DIM,
+        asinh_a: float = 0.0,
     ):
         super().__init__()
         self.ctx_dim = ctx_dim
+        # Target space: asinh_a > 0 transports the flow in an asinh-compressed
+        # space y = asinh(s/a)/asinh(1/a), so the brightness DECADES are spread
+        # out and the (linear) MSE actually constrains the faint extended wings.
+        # asinh_a == 0 → linear space (original behaviour).  'a' sets the
+        # linear→log transition; pick it near the normalised noise level.
+        self.asinh_a = float(asinh_a)
         self.encoder = _ContextEncoder(base, ctx_dim, cond_dim)
         self.velocity = _VelocityUNet(base, mults, emb_dim, ctx_dim)
+
+    def _to_y(self, s_norm: torch.Tensor) -> torch.Tensor:
+        """Flux-normalised source → compressed target space."""
+        if self.asinh_a <= 0:
+            return s_norm
+        return torch.asinh(s_norm / self.asinh_a) / math.asinh(1.0 / self.asinh_a)
+
+    def _from_y(self, y: torch.Tensor) -> torch.Tensor:
+        """Inverse of _to_y: compressed space → flux-normalised source."""
+        if self.asinh_a <= 0:
+            return y
+        return self.asinh_a * torch.sinh(y * math.asinh(1.0 / self.asinh_a))
 
     def forward(
         self,
@@ -174,7 +204,18 @@ class PSFCondFlow(nn.Module):
     ) -> torch.Tensor:
         """Predict velocity field (B, 1, H, W)."""
         ctx = self.encoder(image, cond)
-        return self.velocity(x_t, t, ctx)
+        return self.velocity(x_t, t, ctx, self._cond_maps(image))
+
+    @staticmethod
+    def _cond_maps(image: torch.Tensor) -> torch.Tensor:
+        """Per-sample-normalised (dirty, PSF) maps for spatial conditioning.
+
+        Dirty is divided by its own std (same normalisation as the encoder)
+        so the conditioning channel is O(1); PSF is already peak-normalised.
+        """
+        res, psf = image[:, 0:1], image[:, 1:2]
+        scale = res.flatten(1).std(dim=1).clamp_min(1e-12).view(-1, 1, 1, 1)
+        return torch.cat([res / scale, psf], dim=1)
 
     @staticmethod
     def _flux_scale(image: torch.Tensor) -> torch.Tensor:
@@ -215,6 +256,7 @@ class PSFCondFlow(nn.Module):
         img_rep = image.repeat_interleave(n_samples, dim=0)    # (B*n, 2, H, W)
         cond_rep = cond.repeat_interleave(n_samples, dim=0)    # (B*n, cond_dim)
         ctx = self.encoder(img_rep, cond_rep)                   # (B*n, ctx_dim)
+        cmaps = self._cond_maps(img_rep)                        # (B*n, 2, H, W)
 
         # Flux scale: (B*n, 1, 1, 1) for rescaling output.
         fscale = self._flux_scale(img_rep)                      # (B*n, 1, 1, 1)
@@ -229,9 +271,9 @@ class PSFCondFlow(nn.Module):
                 (B * n_samples,), i * dt,
                 device=image.device, dtype=image.dtype,
             )
-            x = x + dt * self.velocity(x, t_val, ctx)
+            x = x + dt * self.velocity(x, t_val, ctx, cmaps)
 
-        s = torch.relu(x) * fscale                             # rescale to Jy
+        s = torch.relu(self._from_y(x)) * fscale               # inv-transform, Jy
         return s.view(B, n_samples, H, W).squeeze(0) if squeeze else s.view(B, n_samples, H, W)
 
 
@@ -265,17 +307,19 @@ def cfm_loss(
     # which the MSE loss cannot guide at all.
     fscale = PSFCondFlow._flux_scale(image)     # (B, 1, 1, 1)
     s0_norm = s0 / fscale                       # peak ~ 1 for a point source
+    y0 = model._to_y(s0_norm)                    # compressed target space
 
     B = s0.shape[0]
     t = torch.rand(B, device=s0.device, generator=generator)
     eps = torch.randn(s0.shape, device=s0.device, dtype=s0.dtype, generator=generator)
     t_ = t.view(-1, 1, 1, 1)
-    x_t = t_ * s0_norm + (1.0 - t_) * eps
-    u_target = s0_norm - eps
+    x_t = t_ * y0 + (1.0 - t_) * eps
+    u_target = y0 - eps
 
     pred = model(x_t, t, image, cond)
 
-    # Flux-proportional pixel weight (same lever as edm_loss pixel_weight).
+    # Flux-proportional pixel weight (same lever as edm_loss pixel_weight),
+    # computed from the physical (linear) source so bright pixels stay upweighted.
     s_mean = s0_norm.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-12)
     w = (1.0 + pixel_weight_lambda * s0_norm / s_mean).clamp(max=weight_clip)
 
