@@ -33,6 +33,7 @@ from mad_clean.data.cutout_dataset import CutoutDataset
 from mad_clean.data.patch_corpus_dataset import PatchCorpusDataset
 from mad_clean.data.psf_bank import (load_g55_psf_bank, load_corpus_psf_bank,
                                       load_psf_bank_from_npy)
+from mad_clean.data.gpu_sky_generator import GPUSkyGenerator
 from mad_clean.models.coeff_flow import CoeffFlow
 
 
@@ -164,36 +165,44 @@ def run(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    if args.stacks_dir is not None:
-        psf_bank = None
-        print("[train] Corpus stacks mode: PSF bank not loaded.")
-    elif args.psf_npy is not None:
-        psf_bank = load_psf_bank_from_npy(args.psf_npy, target_size=IMAGE_SIZE,
-                                           rotation_augment=True)
-        print(f"[train] PSF bank from npy: {len(psf_bank)} PSFs")
-    elif args.corpus_psf_dir is not None:
-        psf_bank = load_corpus_psf_bank(
-            corpus_fits_dir=args.corpus_psf_dir, target_size=IMAGE_SIZE,
-            rotation_augment=True)
-        print(f"[train] PSF bank size: {len(psf_bank)}")
+    # GPU synthetic mode: generate data on-device, no DataLoader needed.
+    gpu_gen = None
+    if args.psf_npy is not None and args.stacks_dir is None:
+        gpu_gen = GPUSkyGenerator(
+            psf_npy=args.psf_npy, device=device,
+            image_size=IMAGE_SIZE, sigma_noise=1e-4,
+            n_sources=(1, 8), extended_fraction=0.5,
+        )
+        print(f"[train] GPU synthetic generator: {len(gpu_gen.psf_bank)} PSFs on {device}")
+        train_loader = None
+        val_cache    = None   # val also generated on-GPU for consistency
     else:
-        psf_bank = load_g55_psf_bank(
-            repo_root=args.repo_root, target_size=IMAGE_SIZE,
-            rotation_augment=True)
-        print(f"[train] PSF bank size: {len(psf_bank)}")
+        if args.stacks_dir is not None:
+            psf_bank = None
+            print("[train] Corpus stacks mode.")
+        elif args.corpus_psf_dir is not None:
+            psf_bank = load_corpus_psf_bank(
+                corpus_fits_dir=args.corpus_psf_dir, target_size=IMAGE_SIZE,
+                rotation_augment=True)
+            print(f"[train] PSF bank size: {len(psf_bank)}")
+        else:
+            psf_bank = load_g55_psf_bank(
+                repo_root=args.repo_root, target_size=IMAGE_SIZE,
+                rotation_augment=True)
+            print(f"[train] PSF bank size: {len(psf_bank)}")
 
-    val_stacks = args.val_stacks_dir or args.stacks_dir
-    train_ds = make_dataset(psf_bank, args, args.dataset_size,
-                            seed_offset=0,          stacks_dir=args.stacks_dir)
-    val_ds   = make_dataset(psf_bank, args, args.val_size,
-                            seed_offset=10_000_000, stacks_dir=val_stacks)
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
-        prefetch_factor=4 if args.num_workers > 0 else None,
-        collate_fn=collate, persistent_workers=(args.num_workers > 0),
-    )
+        val_stacks = args.val_stacks_dir or args.stacks_dir
+        train_ds = make_dataset(psf_bank, args, args.dataset_size,
+                                seed_offset=0, stacks_dir=args.stacks_dir)
+        val_ds   = make_dataset(psf_bank, args, args.val_size,
+                                seed_offset=10_000_000, stacks_dir=val_stacks)
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+            prefetch_factor=4 if args.num_workers > 0 else None,
+            collate_fn=collate, persistent_workers=(args.num_workers > 0),
+        )
+        val_cache = build_val_cache(val_ds, device, args.num_workers)
 
     flow = CoeffFlow(
         theta_dim=THETA_DIM,
@@ -213,7 +222,6 @@ def run(args):
         start_step = ckpt.get("step", 0)
         print(f"[train] Resumed at step {start_step}")
 
-    val_cache = build_val_cache(val_ds, device, args.num_workers)
     optimizer = optim.Adam(flow.parameters(), lr=args.lr, foreach=False)
 
     def save(path, step, extra=None):
@@ -232,65 +240,98 @@ def run(args):
           f"device={args.device}")
     flow.train()
 
-    while step < args.steps:
-        for img, cond, sky in train_loader:
-            if step >= args.steps:
-                break
-            img, cond, sky = img.to(device), cond.to(device), sky.to(device)
+    def get_batch():
+        """Return (img, cond, sky) on device for one training step."""
+        if gpu_gen is not None:
+            return gpu_gen.sample(args.batch_size)
+        # DataLoader path: handled by the outer loop
+        return None
 
-            # Per-sample normalisation: flow sees O(1) targets.
-            sky_scale = sky.abs().flatten(1).max(dim=1).values.clamp_min(1e-12)
-            theta = (sky / sky_scale.view(-1, 1, 1)).flatten(1)
+    def train_steps_gpu():
+        """Pure GPU training loop (gpu_gen mode)."""
+        nonlocal step, best_val_nll
+        while step < args.steps:
+            img, cond, sky = gpu_gen.sample(args.batch_size)
+            _train_step(img, cond, sky)
 
-            if args.theta_jitter > 0:
-                theta = theta + args.theta_jitter * torch.randn_like(theta)
+    def train_steps_loader():
+        """DataLoader training loop."""
+        nonlocal step, best_val_nll
+        while step < args.steps:
+            for img, cond, sky in train_loader:
+                if step >= args.steps:
+                    break
+                img, cond, sky = img.to(device), cond.to(device), sky.to(device)
+                _train_step(img, cond, sky)
 
-            # Sky-value weighting: upweight source pixels, keep background in loss.
-            sky_w = args.sky_weight_floor + theta.clamp(min=0)
-            sky_w = sky_w / sky_w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+    def _train_step(img, cond, sky):
+        nonlocal step, best_val_nll
 
-            optimizer.zero_grad()
-            nll = -flow.log_prob(theta, img, cond, dim_weights=sky_w).mean()
-            loss = nll / THETA_DIM
+        sky_scale = sky.abs().flatten(1).max(dim=1).values.clamp_min(1e-12)
+        theta = (sky / sky_scale.view(-1, 1, 1)).flatten(1)
+        if args.theta_jitter > 0:
+            theta = theta + args.theta_jitter * torch.randn_like(theta)
+        sky_w = args.sky_weight_floor + theta.clamp(min=0)
+        sky_w = sky_w / sky_w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
 
-            sparsity_val = 0.0
-            if args.sparsity_weight > 0:
-                theta_s = flow.sample_with_grad(img, cond, n=1).squeeze(1)
-                sky_s   = theta_s * sky_scale.view(-1, 1)
-                sparsity = sky_s.abs().mean()
-                loss = loss + args.sparsity_weight * sparsity
-                sparsity_val = float(sparsity.item())
+        optimizer.zero_grad()
+        nll = -flow.log_prob(theta, img, cond, dim_weights=sky_w).mean()
+        loss = nll / THETA_DIM
+        sparsity_val = 0.0
+        if args.sparsity_weight > 0:
+            theta_s  = flow.sample_with_grad(img, cond, n=1).squeeze(1)
+            sparsity = (theta_s * sky_scale.view(-1, 1)).abs().mean()
+            loss     = loss + args.sparsity_weight * sparsity
+            sparsity_val = float(sparsity.item())
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(flow.parameters(), args.grad_clip)
+        optimizer.step()
+        step += 1
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(flow.parameters(), args.grad_clip)
-            optimizer.step()
-            step += 1
+        if step % args.log_every == 0:
+            elapsed = time.time() - t0
+            print(f"  step {step:6d}/{args.steps}  "
+                  f"loss={float(loss.item()):8.4f}  "
+                  f"nll/dim={float(nll.item()) / THETA_DIM:8.4f}  "
+                  f"sparse={sparsity_val:.4e}  "
+                  f"elapsed={elapsed / 60:.1f}m")
+            log.append({"step": step,
+                        "train_loss": float(loss.item()),
+                        "train_nll_per_dim": float(nll.item()) / THETA_DIM,
+                        "train_sparsity": sparsity_val})
 
-            if step % args.log_every == 0:
-                elapsed = time.time() - t0
-                print(f"  step {step:6d}/{args.steps}  "
-                      f"loss={float(loss.item()):8.4f}  "
-                      f"nll/dim={float(nll.item()) / THETA_DIM:8.4f}  "
-                      f"sparse={sparsity_val:.4e}  "
-                      f"elapsed={elapsed / 60:.1f}m")
-                log.append({"step": step,
-                            "train_loss": float(loss.item()),
-                            "train_nll_per_dim": float(nll.item()) / THETA_DIM,
-                            "train_sparsity": sparsity_val})
-
-            if step % args.val_every == 0:
+        if step % args.val_every == 0:
+            if gpu_gen is not None:
+                # Val: fresh GPU samples, never seen during training
+                flow.eval()
+                with torch.no_grad():
+                    vi, vc, vs = gpu_gen.sample(args.val_size)
+                    vsc  = vs.abs().flatten(1).max(dim=1).values.clamp_min(1e-12)
+                    vth  = (vs / vsc.view(-1, 1, 1)).flatten(1)
+                    vsw  = args.sky_weight_floor + vth.clamp(min=0)
+                    vsw  = vsw / vsw.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+                    val_nll = float(
+                        (-flow.log_prob(vth, vi, vc, dim_weights=vsw).mean()
+                         / THETA_DIM).item())
+                flow.train()
+            else:
                 val_nll = eval_val(flow, val_cache, device, args.sky_weight_floor)
-                print(f"  step {step:6d}  val_nll/dim={val_nll:.4f}")
-                if log:
-                    log[-1]["val_nll_per_dim"] = val_nll
-                if val_nll < best_val_nll:
-                    best_val_nll = val_nll
-                    save(out_dir / "best.pt", step, {"val_nll_per_dim": val_nll})
+            print(f"  step {step:6d}  val_nll/dim={val_nll:.4f}")
+            if log:
+                log[-1]["val_nll_per_dim"] = val_nll
+            if val_nll < best_val_nll:
+                best_val_nll = val_nll
+                save(out_dir / "best.pt", step, {"val_nll_per_dim": val_nll})
 
-            if step % args.checkpoint_every == 0:
-                save(out_dir / f"ckpt_{step:07d}.pt", step)
-                with open(out_dir / "log.json", "w") as fh:
-                    json.dump(log, fh, indent=2)
+        if step % args.checkpoint_every == 0:
+            save(out_dir / f"ckpt_{step:07d}.pt", step)
+            with open(out_dir / "log.json", "w") as fh:
+                json.dump(log, fh, indent=2)
+
+    if gpu_gen is not None:
+        train_steps_gpu()
+    else:
+        train_steps_loader()
 
     save(out_dir / "final.pt", step)
     with open(out_dir / "log.json", "w") as fh:
