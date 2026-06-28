@@ -31,7 +31,8 @@ from torch.utils.data import DataLoader
 
 from mad_clean.data.cutout_dataset import CutoutDataset
 from mad_clean.data.patch_corpus_dataset import PatchCorpusDataset
-from mad_clean.data.psf_bank import load_g55_psf_bank, load_corpus_psf_bank
+from mad_clean.data.psf_bank import (load_g55_psf_bank, load_corpus_psf_bank,
+                                      load_psf_bank_from_npy)
 from mad_clean.models.coeff_flow import CoeffFlow
 
 
@@ -53,6 +54,9 @@ def parse_args(argv=None):
                    default="point,blob,shell,filament")
     p.add_argument("--extended_fraction", type=float, default=0.5)
     p.add_argument("--corpus_psf_dir", type=str, default=None)
+    p.add_argument("--psf_npy",        type=str, default=None,
+                   help="Path to a stacks psf.npy (N_fields, H, W). "
+                        "Used for synthetic training on machines without FITS PSFs.")
     p.add_argument("--stacks_dir",     type=str, default=None,
                    help="Path to PatchCorpusDataset stacks directory (train). "
                         "When set, uses real corpus patches instead of synthetic.")
@@ -163,6 +167,10 @@ def run(args):
     if args.stacks_dir is not None:
         psf_bank = None
         print("[train] Corpus stacks mode: PSF bank not loaded.")
+    elif args.psf_npy is not None:
+        psf_bank = load_psf_bank_from_npy(args.psf_npy, target_size=IMAGE_SIZE,
+                                           rotation_augment=True)
+        print(f"[train] PSF bank from npy: {len(psf_bank)} PSFs")
     elif args.corpus_psf_dir is not None:
         psf_bank = load_corpus_psf_bank(
             corpus_fits_dir=args.corpus_psf_dir, target_size=IMAGE_SIZE,

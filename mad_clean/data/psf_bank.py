@@ -164,3 +164,52 @@ def load_g55_psf_bank(
         target_size=target_size,
         rotation_augment=rotation_augment,
     )
+
+
+def load_psf_bank_from_npy(
+    npy_path: str | Path,
+    target_size: int = 128,
+    rotation_augment: bool = True,
+) -> "PSFBankNpy":
+    """Load PSFs directly from a stacks psf.npy array.
+
+    The stacks psf.npy has shape (N_fields, H, W) where each entry is a
+    peak-normalised PSF from the corpus.  No FITS I/O required -- works
+    on remote machines that have the stacks but not the raw FITS files.
+    """
+    return PSFBankNpy(
+        npy_path=Path(npy_path),
+        target_size=target_size,
+        rotation_augment=rotation_augment,
+    )
+
+
+class PSFBankNpy:
+    """PSF bank backed by a stacks psf.npy array instead of FITS files."""
+
+    def __init__(self, npy_path: Path, target_size: int, rotation_augment: bool):
+        raw = np.load(npy_path, mmap_mode="r")   # (N_fields, H, W)
+        rotations = (0, 90, 180, 270) if rotation_augment else (0,)
+        self._psfs: list[np.ndarray] = []
+        for i in range(len(raw)):
+            base = _peak_centred_resize(
+                np.asarray(raw[i], dtype=np.float32), target_size)
+            peak = float(base.max())
+            if not np.isfinite(peak) or peak <= 0.0:
+                continue
+            base = (base / peak).astype(np.float32)
+            for k in range(len(rotations)):
+                rot = np.rot90(base, k=k) if k else base
+                self._psfs.append(np.ascontiguousarray(rot, dtype=np.float32))
+        if not self._psfs:
+            raise ValueError(f"No valid PSFs loaded from {npy_path}")
+
+    def __len__(self) -> int:
+        return len(self._psfs)
+
+    def __getitem__(self, i: int) -> tuple[np.ndarray, dict]:
+        return self._psfs[i].copy(), {}
+
+    def sample(self, rng: np.random.Generator) -> tuple[np.ndarray, dict]:
+        idx = int(rng.integers(0, len(self._psfs)))
+        return self[idx]

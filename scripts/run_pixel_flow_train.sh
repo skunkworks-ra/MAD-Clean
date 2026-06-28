@@ -59,6 +59,7 @@ pixi run -e gpu python scripts/train_pixel_flow.py \
     --num_workers    "${P1_WORKERS}" \
     --morphologies   point,blob,shell,filament \
     --extended_fraction 0.5 \
+    --psf_npy        "${CORPUS_STACKS_DIR}/psf.npy" \
     --sky_weight_floor  "${SKY_WEIGHT_FLOOR}" \
     --sparsity_weight   "${SPARSITY_WEIGHT}" \
     --log_every      100 \
