@@ -179,6 +179,14 @@ def parse_args(argv=None):
     p.add_argument("--num_workers", type=int,   default=4)
     p.add_argument("--log_every",   type=int,   default=100)
     p.add_argument("--checkpoint_every", type=int, default=5_000)
+    p.add_argument("--val_every",   type=int,   default=5_000,
+                   help="Held-out PIXEL validation every N steps (EMA weights): "
+                        "rel-L2(posterior median, truth) on a fixed held-out set. "
+                        "Saves <out>.best.pt by rel-L2 (NOT by loss) + a val PNG. "
+                        "0 disables. Requires --psf_npy.")
+    p.add_argument("--val_size",    type=int,   default=64)
+    p.add_argument("--val_draws",   type=int,   default=8,
+                   help="Posterior draws per held-out scene for the median.")
     p.add_argument("--device",      type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed",        type=int,   default=42)
@@ -228,6 +236,86 @@ def main(argv=None):
     # Kept consistent with the held-out eval (overfit_psf_condflow uses zeros).
     zero_cond = torch.zeros(args.batch_size, COND_DIM, device=device)
 
+    # ── Held-out pixel validation set (fixed, matched distribution) ──────────
+    # Drawn once with a dedicated seed so the metric is comparable over time
+    # and never overlaps the training stream.  Validation = reconstruction in
+    # PIXELS (rel-L2 of the posterior median vs truth), NOT held-out loss:
+    # the loss floors at the irreducible posterior variance and is not a
+    # quality signal (the very thing that misled us — judge pixels).
+    val_gen = None
+    val_img = val_sky = None
+    ema_model = None
+    best_val = float("inf")
+    if args.val_every > 0 and args.psf_npy is not None:
+        val_gen = GPUSkyGenerator(
+            psf_npy=args.psf_npy, device=device, image_size=args.size,
+            sigma_noise=args.gpu_noise, n_sources=(1, 1),
+            extended_fraction=args.extended_fraction,
+            morphologies=["point", "blob", "filament"], blob_sigma=(1.5, 16.0),
+        )
+        torch.manual_seed(args.seed + 7777)
+        val_img, _, val_sky = val_gen.sample(args.val_size)
+        val_img, val_sky = val_img.detach(), val_sky.detach()
+        torch.manual_seed(args.seed)                       # restore train stream
+        ema_model = PSFCondFlow(base=args.base_channels,
+                                asinh_a=args.asinh_a).to(device)
+        val_cond = torch.zeros(args.val_size, COND_DIM, device=device)
+        print(f"Validation: {args.val_size} held-out scenes, "
+              f"{args.val_draws} draws, every {args.val_every} steps (EMA).")
+    elif args.val_every > 0:
+        print("Validation disabled: --psf_npy not set (needs a PSF source).")
+
+    def validate(step):
+        nonlocal best_val
+        ema_model.load_state_dict(ema)
+        ema_model.eval()
+        with torch.no_grad():
+            draws = ema_model.sample(val_img, val_cond,
+                                     n_samples=args.val_draws, n_steps=50)
+            med = draws.median(dim=1).values                # (B, H, W)
+            num = (med - val_sky).flatten(1).norm(dim=1)
+            den = val_sky.flatten(1).norm(dim=1).clamp_min(1e-12)
+            rel_l2 = float((num / den).median())
+            flux = float((med.flatten(1).sum(1)
+                          / val_sky.flatten(1).sum(1).clamp_min(1e-12)).median())
+        improved = rel_l2 < best_val
+        if improved:
+            best_val = rel_l2
+            torch.save(
+                {"step": step, "model": ema, "ema": ema,
+                 "config": {"base_channels": args.base_channels,
+                            "size": args.size, "pw_lambda": args.pw_lambda,
+                            "asinh_a": args.asinh_a},
+                 "val_rel_l2": rel_l2},
+                out_path.with_suffix(".best.pt"))
+        print(f"  [val] step {step}: rel_l2={rel_l2:.3f}  flux_ratio={flux:.2f}"
+              f"{'  *best → ' + str(out_path.with_suffix('.best.pt')) if improved else ''}")
+        _save_val_fig(step, med)
+
+    def _save_val_fig(step, med):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        n = min(4, args.val_size)
+        fig, ax = plt.subplots(n, 3, figsize=(7.5, 2.5 * n))
+        ax = np.atleast_2d(ax)
+        for i in range(n):
+            for k, (img, title) in enumerate([
+                (val_sky[i].cpu().numpy(), "truth"),
+                (val_img[i, 0].cpu().numpy(), "dirty"),
+                (med[i].cpu().numpy(), "post median"),
+            ]):
+                a = ax[i, k]
+                d = np.log10(np.clip(img, 1e-12, None)) if k != 1 else img
+                a.imshow(d, origin="lower", cmap="inferno" if k != 1 else "RdBu_r")
+                if i == 0:
+                    a.set_title(title, fontsize=9)
+                a.axis("off")
+        fig.tight_layout()
+        fig.savefig(out_path.parent / f"{out_path.stem}_val.png", dpi=110)
+        plt.close(fig)
+
     model.train()
     t0 = time.time()
     running = 0.0
@@ -256,6 +344,8 @@ def main(argv=None):
         if step % args.checkpoint_every == 0:
             save(step)
             print(f"  checkpoint → {out_path}  (step {step})")
+        if val_gen is not None and step % args.val_every == 0:
+            validate(step)
 
     if args.gpu_gen:
         # On-GPU generation: no DataLoader, no CPU workers.
