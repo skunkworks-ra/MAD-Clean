@@ -53,6 +53,7 @@ class GPUSkyGenerator:
         n_sources: tuple[int, int] = (1, 8),
         extended_fraction: float = 0.5,
         morphologies: list[str] | None = None,
+        blob_sigma: tuple[float, float] = (1.5, 7.5),
     ):
         import numpy as np
         raw = np.load(psf_npy, mmap_mode="r")            # (N, H, W)
@@ -65,6 +66,7 @@ class GPUSkyGenerator:
         self.morphologies  = set(morphologies) if morphologies else {"point", "blob", "shell", "filament"}
         self.n_src_min, self.n_src_max = n_sources
         self.extended_frac = extended_fraction
+        self.blob_sigma    = blob_sigma
         self.cond_dim      = COND_DIM
 
         # Coordinate grids, shared across calls
@@ -165,7 +167,8 @@ class GPUSkyGenerator:
         # --- Blobs (morph == 1) ------------------------------------------
         bm = (morph == 1) & valid
         if bm.any():
-            sigma = torch.rand(B, N, device=dev) * 6 + 1.5           # 1.5–7.5 px
+            lo, hi = self.blob_sigma
+            sigma = torch.rand(B, N, device=dev) * (hi - lo) + lo
             sky   = self._add_gaussians(sky, cx, cy, flux, sigma, bm, xg, yg)
 
         # --- Shells (morph == 2) -----------------------------------------
@@ -188,13 +191,14 @@ class GPUSkyGenerator:
 
     @staticmethod
     def _add_points(sky, cx, cy, flux, mask):
-        B = sky.shape[0]
-        for b in range(B):
-            for n in range(cx.shape[1]):
-                if mask[b, n]:
-                    xi = int(cx[b, n].item())
-                    yi = int(cy[b, n].item())
-                    sky[b, yi, xi] = sky[b, yi, xi] + flux[b, n]
+        # Vectorised scatter-add: no Python loop, no per-source .item() GPU
+        # syncs (those throttle fast GPUs).  Masked-out slots contribute 0.
+        B, H, W = sky.shape
+        xi = cx.long().clamp_(0, W - 1)
+        yi = cy.long().clamp_(0, H - 1)
+        lin = yi * W + xi                                  # (B, N) flat pixel idx
+        vals = flux * mask.to(flux.dtype)                  # (B, N), 0 where masked
+        sky.view(B, H * W).scatter_add_(1, lin, vals)
         return sky
 
     @staticmethod

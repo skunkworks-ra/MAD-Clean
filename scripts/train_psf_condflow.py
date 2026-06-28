@@ -8,13 +8,15 @@ recover extended dynamic range).  Loss is pixel-weighted CFM MSE.
 
 GPU required.
 
-Example (general deconvolution over a corpus PSF bank)
-------------------------------------------------------
+Example (general deconvolution over a corpus PSF bank, on-GPU generation)
+------------------------------------------------------------------------
     pixi run -e gpu python scripts/train_psf_condflow.py \\
-        --out models/psf_condflow.pt --steps 100000 --batch_size 16 \\
-        --asinh_a 1e-2 --psf_npy /path/to/corpus_stacks/train/psf.npy
+        --out models/psf_condflow.pt --steps 100000 --batch_size 128 \\
+        --asinh_a 1e-2 --psf_npy /path/to/corpus_stacks/train/psf.npy --gpu_gen
 
-Omit --psf_npy to use the in-repo G55 bank.
+--gpu_gen synthesises batches entirely on the GPU (no DataLoader/CPU workers),
+removing the data bottleneck that starves fast GPUs.  Without it, an on-the-fly
+CPU DataLoader is used (omit --psf_npy to fall back to the in-repo G55 bank).
 
 Held-out eval after training (restores asinh_a from the checkpoint):
     pixi run -e gpu python scripts/overfit_psf_condflow.py \\
@@ -40,6 +42,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from scipy.ndimage import gaussian_filter
 
 from mad_clean.data.field_sky import assemble_corpus_field
+from mad_clean.data.gpu_sky_generator import GPUSkyGenerator
 from mad_clean.data.psf_bank import load_g55_psf_bank, load_psf_bank_from_npy
 from mad_clean.imaging.forward import ImageDomainForward
 from mad_clean.models.mdn_asp import COND_DIM
@@ -161,6 +164,15 @@ def parse_args(argv=None):
     p.add_argument("--psf_npy",     type=str,   default=None,
                    help="Corpus PSF stack (N_fields,H,W).npy for general "
                         "deconvolution. Omit to use the in-repo G55 bank.")
+    p.add_argument("--gpu_gen",     action="store_true",
+                   help="Generate batches entirely on the GPU (GPUSkyGenerator): "
+                        "no DataLoader/CPU workers. Removes the data bottleneck "
+                        "on fast GPUs. Requires --psf_npy. Morphologies: "
+                        "point/blob/filament (NO rings); blob sigma 1.5-16 px.")
+    p.add_argument("--gpu_noise",   type=float, default=1e-4,
+                   help="Dirty-image RMS noise in --gpu_gen mode.")
+    p.add_argument("--extended_fraction", type=float, default=0.5,
+                   help="Fraction of non-point sources in --gpu_gen mode.")
     p.add_argument("--snr_min",     type=float, default=5.0)
     p.add_argument("--snr_max",     type=float, default=100.0)
     p.add_argument("--ema_decay",   type=float, default=0.9999)
@@ -211,24 +223,9 @@ def main(argv=None):
             out_path,
         )
 
-    ds = _SingleSourceStream(
-        size=args.size,
-        base_seed=args.seed + 1,
-        repo_root=_REPO_ROOT,
-        snr_range=(args.snr_min, args.snr_max),
-        morph_probs=(0.5, 0.3, 0.2),
-        psf_npy=args.psf_npy,
-    )
-    loader = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        persistent_workers=args.num_workers > 0,
-        pin_memory=(device.type == "cuda"),
-    )
-
     # Zero conditioning: sigma_local and config_one_hot are zero; the encoder
     # recovers absolute flux via log10(residual_scale) appended internally.
+    # Kept consistent with the held-out eval (overfit_psf_condflow uses zeros).
     zero_cond = torch.zeros(args.batch_size, COND_DIM, device=device)
 
     model.train()
@@ -237,26 +234,19 @@ def main(argv=None):
     step = 0
     gen = torch.Generator(device=device).manual_seed(args.seed + 99)
 
-    for image, s0 in loader:
-        step += 1
-        if step > args.steps:
-            break
-
-        image = image.to(device, non_blocking=True)    # (B, 2, H, W)
-        s0 = s0.to(device, non_blocking=True)[:, None] # (B, 1, H, W)
-        cond = zero_cond[:image.shape[0]]              # handle last batch
-
+    def train_step(image, s0):
+        """One optimisation step on a device-resident (image, s0) batch."""
+        nonlocal step, running
+        cond = zero_cond[:image.shape[0]]
         opt.zero_grad()
         loss = cfm_loss(model, s0, image, cond,
                         pixel_weight_lambda=args.pw_lambda, generator=gen)
         loss.backward()
         opt.step()
-
         with torch.no_grad():
             d = args.ema_decay
             for k, v in model.state_dict().items():
                 ema[k].mul_(d).add_(v.detach(), alpha=1.0 - d)
-
         running += float(loss)
         if step % args.log_every == 0:
             rate = step / (time.time() - t0)
@@ -266,6 +256,46 @@ def main(argv=None):
         if step % args.checkpoint_every == 0:
             save(step)
             print(f"  checkpoint → {out_path}  (step {step})")
+
+    if args.gpu_gen:
+        # On-GPU generation: no DataLoader, no CPU workers.
+        if args.psf_npy is None:
+            raise SystemExit("--gpu_gen requires --psf_npy (corpus PSF stack).")
+        sky_gen = GPUSkyGenerator(
+            psf_npy=args.psf_npy, device=device, image_size=args.size,
+            sigma_noise=args.gpu_noise, n_sources=(1, 1),
+            extended_fraction=args.extended_fraction,
+            morphologies=["point", "blob", "filament"],   # NO rings
+            blob_sigma=(1.5, 16.0),                         # compact-to-extended
+        )
+        print(f"GPU generator: {len(sky_gen.psf_bank)} PSFs, single-source, "
+              f"point/blob/filament")
+        while step < args.steps:
+            img, _, sky = sky_gen.sample(args.batch_size)   # img=[dirty,psf]
+            step += 1
+            train_step(img, sky[:, None])
+    else:
+        ds = _SingleSourceStream(
+            size=args.size,
+            base_seed=args.seed + 1,
+            repo_root=_REPO_ROOT,
+            snr_range=(args.snr_min, args.snr_max),
+            morph_probs=(0.5, 0.3, 0.2),
+            psf_npy=args.psf_npy,
+        )
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
+            pin_memory=(device.type == "cuda"),
+        )
+        for image, s0 in loader:
+            if step >= args.steps:
+                break
+            step += 1
+            train_step(image.to(device, non_blocking=True),
+                       s0.to(device, non_blocking=True)[:, None])
 
     save(args.steps)
     print(f"Done → {out_path}")
