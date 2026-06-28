@@ -33,6 +33,7 @@ import torch.optim as optim  # noqa: E402
 from mad_clean.data.cutout_dataset import CutoutDataset  # noqa: E402
 from mad_clean.data.patch_corpus_dataset import PatchCorpusDataset  # noqa: E402
 from mad_clean.data.psf_bank import load_g55_psf_bank, load_corpus_psf_bank  # noqa: E402
+from mad_clean.data.gpu_sky_generator import GPUSkyGenerator  # noqa: E402
 from mad_clean.models.coeff_flow import CoeffFlow  # noqa: E402
 from mad_clean.models.conv_pixel_flow import ConvPixelFlow  # noqa: E402
 
@@ -63,6 +64,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--corpus_psf_dir", type=str, default=None,
                    help="Directory of corpus_field_XXXX_psf.fits. "
                         "When set, uses corpus PSF bank instead of G55.")
+    p.add_argument("--psf_npy", type=str, default=None,
+                   help="Path to (N_fields, H, W) psf.npy. When set, uses "
+                        "GPUSkyGenerator to draw the frozen batch.")
     p.add_argument("--residual_weight", type=float, default=0.0,
                    help="Weight on RESOLVE-style residual loss. 0 => pure NLL.")
     p.add_argument("--l1_outside_weight", type=float, default=0.0,
@@ -102,6 +106,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Additive floor on sky weights before normalisation. "
                         "Keeps background pixels in the loss (prevents "
                         "conditioning collapse) while still upweighting sources.")
+    p.add_argument("--sky_sigma_cut", type=float, default=0.0,
+                   help="If > 0, hard-cut NLL weighting: only pixels whose true "
+                        "sky exceeds (cut * sigma_noise) are scored; sub-threshold "
+                        "pixels get zero weight. Bypasses --sky_weight_floor. "
+                        "Replaces the sparsity penalty as the source-selection "
+                        "mechanism. 0 => floor-based soft weighting (default).")
     p.add_argument("--sparsity_weight", type=float, default=0.0,
                    help="Weight on L1 sparsity prior applied to posterior samples. "
                         "Pushes background pixels toward zero; sky-weighted NLL "
@@ -152,7 +162,22 @@ def run(args) -> dict:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.stacks_dir is not None:
+    if args.psf_npy is not None:
+        print(f"[overfit] GPUSkyGenerator from {args.psf_npy!r} ...")
+        torch.manual_seed(args.seed)
+        morph_list = [m.strip() for m in args.morphologies.split(",")]
+        gen = GPUSkyGenerator(
+            psf_npy=args.psf_npy, device=device,
+            image_size=128, sigma_noise=1e-4,
+            n_sources=(1, 8), extended_fraction=0.5,
+            morphologies=morph_list,
+        )
+        img_t, cond_t, sky_t = gen.sample(args.n_samples)
+        res_list  = list(img_t[:, 0].cpu())
+        psf_list  = list(img_t[:, 1].cpu())
+        cond_list = list(cond_t.cpu())
+        sky_list  = list(sky_t.cpu())
+    elif args.stacks_dir is not None:
         # Load the N brightest patches from a real corpus stacks directory.
         print(f"[overfit] Loading real patches from {args.stacks_dir!r} ...")
         corpus_ds = PatchCorpusDataset(args.stacks_dir)
@@ -249,8 +274,18 @@ def run(args) -> dict:
             # cannot satisfy the loss by outputting zeros everywhere.
             # Weights are normalised per sample so the total loss magnitude
             # is unchanged (mean weight = 1).
-            sky_w = args.sky_weight_floor + theta.clamp(min=0)
-            sky_w = sky_w / sky_w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+            if args.sky_sigma_cut > 0:
+                # Hard sigma-cut: score only pixels above k*sigma_noise.
+                # threshold in theta-space = k*sigma_noise/sky_scale (sky_scale
+                # is the batch peak used to normalise theta). Mean-normalised so
+                # the surviving pixels carry mass THETA_DIM (scale-stable vs /D).
+                threshold = args.sky_sigma_cut * 1e-4 / sky_scale.to(device)
+                sky_w = theta.clamp(min=0)
+                sky_w = sky_w * (sky_w > threshold)
+                sky_w = sky_w / sky_w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+            else:
+                sky_w = args.sky_weight_floor + theta.clamp(min=0)
+                sky_w = sky_w / sky_w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
             nll = -flow.log_prob(theta_step, image, cond, dim_weights=sky_w).mean()
         else:
             nll = flow.nll_loss(theta_step, image, cond)

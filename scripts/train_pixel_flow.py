@@ -1,15 +1,16 @@
 """Full-scale training for the pixel-space flow deconvolution model.
 
-Mirrors train_wavelet_npe.py but operates directly in pixel space:
-  theta = sky / sky_scale  (flattened 128*128 = 16384 dims)
+Three data modes (mutually exclusive, checked in order):
+  --psf_npy      : GPU synthetic generator (phase 1)
+  --fits_dir     : FITSCropDataset over real FITS fields (phase 2)
+  --stacks_dir   : PatchCorpusDataset from memmap stacks (legacy)
 
-Loss: sky-value-weighted NLL + L1 sparsity on posterior samples.
-  - Sky weighting: floor + sky_value, normalised to mean=1 per sample.
-    Upweights source pixels without zeroing background gradient.
-  - Sparsity: L1 on a single posterior sample per step, pushes
-    background pixels toward zero.
-
-Proven working on 8-sample overfit (overfit_pixel_sparse settings).
+Loss terms (all optional via weight flags):
+  NLL       : sky-value-weighted flow matching NLL (always on)
+  sparsity  : L1 on a posterior sample, weight=--sparsity_weight
+  residual  : L1( PSF ⊛ sky_hat - dirty ), weight=--residual_weight
+              sky_hat = reparameterised sample; reuses the sparsity
+              sample when both are active.  PSF-aware data consistency.
 """
 from __future__ import annotations
 
@@ -31,14 +32,33 @@ from torch.utils.data import DataLoader
 
 from mad_clean.data.cutout_dataset import CutoutDataset
 from mad_clean.data.patch_corpus_dataset import PatchCorpusDataset
+from mad_clean.data.fits_crop_dataset import FITSCropDataset
 from mad_clean.data.psf_bank import (load_g55_psf_bank, load_corpus_psf_bank,
                                       load_psf_bank_from_npy)
-from mad_clean.data.gpu_sky_generator import GPUSkyGenerator
+from mad_clean.data.gpu_sky_generator import GPUSkyGenerator, fft_convolve
 from mad_clean.models.coeff_flow import CoeffFlow
 
 
 THETA_DIM  = 128 * 128   # pixel-space target dimension
 IMAGE_SIZE = 128
+SIGMA_NOISE = 1e-4       # matches CutoutDataset / GPUSkyGenerator
+
+
+def sky_weights(theta, sky_scale, floor, sigma_cut):
+    """Per-dim NLL weights, mean-normalised to 1 (sum = theta_dim) so the
+    trailing /THETA_DIM lands at O(1).
+
+    sigma_cut > 0 : hard-cut — only pixels with true sky > cut*sigma_noise
+                    are scored (threshold in theta-space = cut*sigma/sky_scale).
+    sigma_cut == 0: floor-based soft weighting (floor + sky_value).
+    """
+    if sigma_cut > 0:
+        threshold = sigma_cut * SIGMA_NOISE / sky_scale.view(-1, 1)
+        w = theta.clamp(min=0)
+        w = w * (w > threshold)
+    else:
+        w = floor + theta.clamp(min=0)
+    return w / w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 def parse_args(argv=None):
@@ -63,14 +83,28 @@ def parse_args(argv=None):
                         "When set, uses real corpus patches instead of synthetic.")
     p.add_argument("--val_stacks_dir", type=str, default=None,
                    help="Stacks dir for validation. Falls back to --stacks_dir.")
+    p.add_argument("--fits_dir",       type=str, default=None,
+                   help="Directory of corpus FITS files (phase 2). "
+                        "Uses FITSCropDataset with random 128x128 crops.")
+    p.add_argument("--gpu_cache",      action="store_true",
+                   help="Cache all FITS data on GPU at init (fits_dir mode). "
+                        "Requires num_workers=0; use on machines with >=4 GB VRAM.")
     # Loss
     p.add_argument("--sky_weight_floor", type=float, default=0.1,
                    help="Additive floor on per-pixel NLL weights. floor + sky_value, "
                         "normalised to mean=1. Keeps background in loss while "
                         "upweighting source pixels.")
+    p.add_argument("--sky_sigma_cut", type=float, default=0.0,
+                   help="If > 0, hard-cut NLL weighting: only pixels whose true sky "
+                        "exceeds (cut * sigma_noise) are scored, sub-threshold get "
+                        "zero weight. Bypasses --sky_weight_floor. Source-selection "
+                        "via threshold instead of sparsity penalty. 0 => floor.")
     p.add_argument("--sparsity_weight",  type=float, default=1.0,
                    help="Weight on L1 sparsity prior on posterior samples. "
                         "Drives background pixels toward zero.")
+    p.add_argument("--residual_weight",  type=float, default=0.0,
+                   help="Weight on L1( PSF ⊛ sky_hat - dirty ) data-fidelity term. "
+                        "Reuses the sparsity sample when sparsity_weight > 0.")
     p.add_argument("--theta_jitter",     type=float, default=0.0,
                    help="Gaussian noise std added to normalised theta during "
                         "training. 0 disables.")
@@ -139,7 +173,7 @@ def build_val_cache(val_ds, device, num_workers):
     return imgs, conds, skies
 
 
-def eval_val(flow, val_cache, device, sky_weight_floor):
+def eval_val(flow, val_cache, device, sky_weight_floor, sky_sigma_cut):
     imgs, conds, skies = val_cache
     flow.eval()
     nlls = []
@@ -150,8 +184,7 @@ def eval_val(flow, val_cache, device, sky_weight_floor):
             sky  = skies[i:i+64]
             sky_scale = sky.abs().flatten(1).max(dim=1).values.clamp_min(1e-12)
             theta = (sky / sky_scale.view(-1, 1, 1)).flatten(1)
-            sky_w = sky_weight_floor + theta.clamp(min=0)
-            sky_w = sky_w / sky_w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+            sky_w = sky_weights(theta, sky_scale, sky_weight_floor, sky_sigma_cut)
             nll = flow.nll_loss(theta, img, cond, dim_weights=sky_w)
             nlls.append(float(nll.item()))
     flow.train()
@@ -167,15 +200,34 @@ def run(args):
 
     # GPU synthetic mode: generate data on-device, no DataLoader needed.
     gpu_gen = None
-    if args.psf_npy is not None and args.stacks_dir is None:
+    if args.psf_npy is not None and args.stacks_dir is None and args.fits_dir is None:
         gpu_gen = GPUSkyGenerator(
             psf_npy=args.psf_npy, device=device,
             image_size=IMAGE_SIZE, sigma_noise=1e-4,
             n_sources=(1, 8), extended_fraction=0.5,
+            morphologies=[m.strip() for m in args.morphologies.split(",")],
         )
         print(f"[train] GPU synthetic generator: {len(gpu_gen.psf_bank)} PSFs on {device}")
         train_loader = None
         val_cache    = None   # val also generated on-GPU for consistency
+    elif args.fits_dir is not None:
+        print(f"[train] FITS crop mode: {args.fits_dir}")
+        train_ds = FITSCropDataset(
+            args.fits_dir, patch_size=IMAGE_SIZE, length=args.dataset_size,
+            gpu_cache=args.gpu_cache, device=device,
+        )
+        val_ds = FITSCropDataset(
+            args.fits_dir, patch_size=IMAGE_SIZE, length=args.val_size,
+            gpu_cache=args.gpu_cache, device=device,
+        )
+        nw = 0 if args.gpu_cache else args.num_workers
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=nw, pin_memory=(not args.gpu_cache and device.type == "cuda"),
+            prefetch_factor=4 if nw > 0 else None,
+            collate_fn=collate, persistent_workers=(nw > 0),
+        )
+        val_cache = build_val_cache(val_ds, device, nw)
     else:
         if args.stacks_dir is not None:
             psf_bank = None
@@ -217,7 +269,7 @@ def run(args):
 
     start_step = 0
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         flow.load_state_dict(ckpt["model"])
         start_step = ckpt.get("step", 0)
         print(f"[train] Resumed at step {start_step}")
@@ -269,20 +321,32 @@ def run(args):
 
         sky_scale = sky.abs().flatten(1).max(dim=1).values.clamp_min(1e-12)
         theta = (sky / sky_scale.view(-1, 1, 1)).flatten(1)
+        sky_w = sky_weights(theta, sky_scale, args.sky_weight_floor,
+                            args.sky_sigma_cut)
         if args.theta_jitter > 0:
             theta = theta + args.theta_jitter * torch.randn_like(theta)
-        sky_w = args.sky_weight_floor + theta.clamp(min=0)
-        sky_w = sky_w / sky_w.mean(dim=-1, keepdim=True).clamp_min(1e-12)
 
         optimizer.zero_grad()
         nll = -flow.log_prob(theta, img, cond, dim_weights=sky_w).mean()
         loss = nll / THETA_DIM
         sparsity_val = 0.0
-        if args.sparsity_weight > 0:
-            theta_s  = flow.sample_with_grad(img, cond, n=1).squeeze(1)
-            sparsity = (theta_s * sky_scale.view(-1, 1)).abs().mean()
-            loss     = loss + args.sparsity_weight * sparsity
-            sparsity_val = float(sparsity.item())
+        residual_val = 0.0
+        need_sample = args.sparsity_weight > 0 or args.residual_weight > 0
+        if need_sample:
+            theta_s = flow.sample_with_grad(img, cond, n=1).squeeze(1)
+            sky_hat = (theta_s * sky_scale.view(-1, 1)).view(
+                -1, IMAGE_SIZE, IMAGE_SIZE).clamp(min=0)
+            if args.sparsity_weight > 0:
+                sparsity = sky_hat.abs().mean()
+                loss = loss + args.sparsity_weight * sparsity
+                sparsity_val = float(sparsity.item())
+            if args.residual_weight > 0:
+                psf_b   = img[:, 1]   # (B, H, W) peak-normalised PSF
+                dirty_b = img[:, 0]   # (B, H, W) observed dirty
+                pred_dirty = fft_convolve(sky_hat, psf_b)
+                residual = (pred_dirty - dirty_b).abs().mean()
+                loss = loss + args.residual_weight * residual
+                residual_val = float(residual.item())
         loss.backward()
         torch.nn.utils.clip_grad_norm_(flow.parameters(), args.grad_clip)
         optimizer.step()
@@ -294,11 +358,13 @@ def run(args):
                   f"loss={float(loss.item()):8.4f}  "
                   f"nll/dim={float(nll.item()) / THETA_DIM:8.4f}  "
                   f"sparse={sparsity_val:.4e}  "
+                  f"resid={residual_val:.4e}  "
                   f"elapsed={elapsed / 60:.1f}m")
             log.append({"step": step,
                         "train_loss": float(loss.item()),
                         "train_nll_per_dim": float(nll.item()) / THETA_DIM,
-                        "train_sparsity": sparsity_val})
+                        "train_sparsity": sparsity_val,
+                        "train_residual": residual_val})
 
         if step % args.val_every == 0:
             if gpu_gen is not None:
@@ -308,14 +374,15 @@ def run(args):
                     vi, vc, vs = gpu_gen.sample(args.val_size)
                     vsc  = vs.abs().flatten(1).max(dim=1).values.clamp_min(1e-12)
                     vth  = (vs / vsc.view(-1, 1, 1)).flatten(1)
-                    vsw  = args.sky_weight_floor + vth.clamp(min=0)
-                    vsw  = vsw / vsw.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+                    vsw  = sky_weights(vth, vsc, args.sky_weight_floor,
+                                       args.sky_sigma_cut)
                     val_nll = float(
                         (-flow.log_prob(vth, vi, vc, dim_weights=vsw).mean()
                          / THETA_DIM).item())
                 flow.train()
             else:
-                val_nll = eval_val(flow, val_cache, device, args.sky_weight_floor)
+                val_nll = eval_val(flow, val_cache, device,
+                                   args.sky_weight_floor, args.sky_sigma_cut)
             print(f"  step {step:6d}  val_nll/dim={val_nll:.4f}")
             if log:
                 log[-1]["val_nll_per_dim"] = val_nll

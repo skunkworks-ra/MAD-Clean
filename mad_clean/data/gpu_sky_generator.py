@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from mad_clean.models.mdn_asp import COND_DIM
 
 
-def _fft_convolve(sky: torch.Tensor, psf: torch.Tensor) -> torch.Tensor:
+def fft_convolve(sky: torch.Tensor, psf: torch.Tensor) -> torch.Tensor:
     """Zero-padded FFT convolution. Both (B, H, W). Returns (B, H, W)."""
     B, H, W = sky.shape
     fH, fW = H + H - 1, W + W - 1
@@ -52,6 +52,7 @@ class GPUSkyGenerator:
         sigma_noise: float = 1e-4,
         n_sources: tuple[int, int] = (1, 8),
         extended_fraction: float = 0.5,
+        morphologies: list[str] | None = None,
     ):
         import numpy as np
         raw = np.load(psf_npy, mmap_mode="r")            # (N, H, W)
@@ -60,6 +61,8 @@ class GPUSkyGenerator:
         self.device        = device
         self.H = self.W    = image_size
         self.sigma_noise   = sigma_noise
+        # morphologies to generate: subset of {point, blob, shell, filament}
+        self.morphologies  = set(morphologies) if morphologies else {"point", "blob", "shell", "filament"}
         self.n_src_min, self.n_src_max = n_sources
         self.extended_frac = extended_fraction
         self.cond_dim      = COND_DIM
@@ -90,7 +93,7 @@ class GPUSkyGenerator:
         psfs = self.psf_bank[idx]                         # (B, H, W)
 
         sky  = self._make_sky(B)                          # (B, H, W)
-        dirty = _fft_convolve(sky, psfs)
+        dirty = fft_convolve(sky, psfs)
         dirty = dirty + self.sigma_noise * torch.randn_like(dirty)
 
         img  = torch.stack([dirty, psfs], dim=1)          # (B, 2, H, W)
@@ -123,12 +126,26 @@ class GPUSkyGenerator:
         flux = torch.rand(B, N, device=dev) * 0.029 + 0.001          # (B, N)
 
         # Morphology mask: 0=point, 1=blob, 2=shell, 3=filament
-        is_extended = torch.rand(B, N, device=dev) < self.extended_frac
-        morph = torch.where(
-            is_extended,
-            torch.randint(1, 4, (B, N), device=dev),
-            torch.zeros(B, N, dtype=torch.long, device=dev),
-        )                                                             # (B, N)
+        # Restrict to active morphologies; remap to indices within allowed set.
+        all_morphs = ["point", "blob", "shell", "filament"]
+        active = [i for i, m in enumerate(all_morphs) if m in self.morphologies]
+        has_point    = 0 in active
+        extended_ids = [i for i in active if i != 0]
+        if not active:
+            return torch.zeros(B, self.H, self.W, device=dev)
+        if not extended_ids:
+            # point only
+            morph = torch.zeros(B, N, dtype=torch.long, device=dev)
+        elif not has_point:
+            # extended only
+            choices = torch.tensor(extended_ids, device=dev)
+            morph = choices[torch.randint(0, len(choices), (B, N), device=dev)]
+        else:
+            is_extended = torch.rand(B, N, device=dev) < self.extended_frac
+            choices = torch.tensor(extended_ids, device=dev)
+            ext_morph = choices[torch.randint(0, len(choices), (B, N), device=dev)]
+            morph = torch.where(is_extended, ext_morph,
+                                torch.zeros(B, N, dtype=torch.long, device=dev))
 
         # Source-valid mask: zero out slots beyond n_src[b]
         slot_idx = torch.arange(N, device=dev).view(1, N)            # (1, N)
