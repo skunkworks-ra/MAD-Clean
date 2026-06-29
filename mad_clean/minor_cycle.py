@@ -27,7 +27,9 @@ from mad_clean.data.cutout_dataset import CutoutDataset, standardise_log_flux
 from mad_clean.data.extended_sky import BEAM_SIGMA_PX
 from mad_clean.models.mdn_asp import MDNAsp, MixParams, make_cond
 
-__all__ = ["render_aspen", "minor_cycle", "AspenCommit"]
+__all__ = ["render_aspen", "minor_cycle", "AspenCommit",
+           "minor_cycle_flow", "FlowCommit",
+           "minor_cycle_flow_greedy"]
 
 _CUTOUT = 128
 _HALF   = _CUTOUT // 2
@@ -237,6 +239,276 @@ def minor_cycle(
               f"flux med/max={np.median(fluxes):.4f}/{fluxes.max():.4f} Jy  "
               f"cx spread={cxs.std():.1f}px  cy spread={cys.std():.1f}px  "
               f"stop={stop_reason}")
+
+    return model_update, commits, stop_reason
+
+
+# ---------------------------------------------------------------------------
+# Flow minor cycle (PSFCondFlow — pixel-window solver)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FlowCommit:
+    """One committed flow window."""
+    cx:    float    # window-centre column in full image
+    cy:    float    # window-centre row in full image
+    flux:  float    # committed flux (Jy) = loop_gain * sum(thresholded window)
+
+
+def _tile_origins(L: int, tile: int, stride: int) -> list[int]:
+    """Tile top-left coords covering [0, L), last tile flush to the edge."""
+    if L <= tile:
+        return [0]
+    os = list(range(0, L - tile + 1, stride))
+    if os[-1] != L - tile:
+        os.append(L - tile)
+    return os
+
+
+def minor_cycle_flow(
+    residual:   np.ndarray,       # (H, W) float32, Jy/beam
+    psf:        np.ndarray,       # (H, W) float32, peak = 1
+    sigma:      float,            # noise estimate (Jy/beam)
+    model,                        # PSFCondFlow
+    *,
+    threshold:    float | None = None,  # per-tile stop (this cycle's 3-sigma)
+    loop_gain:    float = 0.1,
+    n_sigma_stop: float = 3.0,
+    speckle_frac:    float = 0.01,
+    conf_k:          float = 3.0,    # keep pixels with median >= conf_k * MAD(draws)
+    n_samples:       int   = 8,
+    n_steps:         int   = 50,
+    tile:            int   = 128,
+    stride:          int   = 64,     # 50% overlap -> feathered overlap-add
+    inner_max:       int   = 50,     # max flow passes per tile (clean-to-stop cap)
+    max_components:  int   = 10000,  # total flow passes per minor cycle (safety)
+    image_mask:  np.ndarray | None = None,
+    device: str | torch.device = "cpu",
+) -> tuple[np.ndarray, list[FlowCommit], str]:
+    """Run the PSFCondFlow minor cycle as a TILE SWEEP (not peak-greedy).
+
+    Global quantities (noise, threshold) are computed on the full image by the
+    caller, once per major cycle, and passed in.  Here we sweep a fixed,
+    overlapping tile grid over the masked region and clean EACH tile down to the
+    per-cycle stopping criterion (`threshold`), so diffuse emission that never
+    forms a global peak is still covered.  Per tile, per pass:
+      1. sample the flow on (residual tile, centred PSF), zero conditioning;
+      2. confidence-gate the posterior (median >= conf_k * MAD across draws) so
+         only real emission, not speckle, is kept;
+      3. commit loop_gain * gated_window, FEATHERED (Hann) for seamless
+         overlap-add into the model;
+      4. clean the tile residual over that beam-area footprint by loop_gain
+         (NO convolution — the major cycle re-images exactly);
+    repeat on the tile until its in-mask peak < threshold (or the gate empties).
+    """
+    import torch as _torch
+    from mad_clean.models.mdn_asp import COND_DIM
+
+    device = _torch.device(device)
+    model.eval()
+    H, W = residual.shape
+    residual = residual.copy().astype(np.float32)
+    model_update = np.zeros((H, W), dtype=np.float32)
+    commits: list[FlowCommit] = []
+
+    stop = threshold if threshold is not None else n_sigma_stop * sigma
+    zero_cond = _torch.zeros(1, COND_DIM, device=device)
+    psf_cut = _crop_psf_centred(psf, tile)
+    psf_t = _torch.from_numpy(psf_cut).float().to(device)
+
+    # Hann feather (peak 1 centre, ->0 at tile edges) for overlap-add blending.
+    w1 = np.hanning(tile).astype(np.float32)
+    feather = np.outer(w1, w1); feather /= float(feather.max())
+
+    total = 0
+    for r0 in _tile_origins(H, tile, stride):
+        for c0 in _tile_origins(W, tile, stride):
+            r1 = r0 + tile; c1 = c0 + tile
+            tmask = (np.ones((tile, tile), bool) if image_mask is None
+                     else image_mask[r0:r1, c0:c1])
+            if not tmask.any():
+                continue
+            sub = residual[r0:r1, c0:c1]            # view into residual
+            for _ in range(inner_max):
+                if total >= max_components:
+                    break
+                masked = np.where(tmask, sub, -np.inf)
+                pr, pc = np.unravel_index(int(masked.argmax()), masked.shape)
+                peak = float(sub[pr, pc])
+                if peak < stop:
+                    break
+                img_t = _torch.stack([
+                    _torch.from_numpy(sub.copy()).float().to(device), psf_t
+                ])[None]                             # (1, 2, tile, tile)
+                with _torch.no_grad():
+                    draws = model.sample(img_t, zero_cond,
+                                         n_samples=n_samples, n_steps=n_steps).squeeze(0)
+                    med = draws.median(dim=0).values
+                    mad = 1.4826 * (draws - med).abs().median(dim=0).values
+                    wpk = float(med.max())
+                    keep = (med >= conf_k * mad) & (med >= speckle_frac * wpk)
+                    win = _torch.where(keep, med,
+                                       _torch.zeros_like(med)).cpu().numpy().astype(np.float32)
+                if wpk <= 0 or not win.any():
+                    break
+                commit = (loop_gain * win * feather).astype(np.float32)
+                commit = np.where(tmask, commit, 0.0).astype(np.float32)
+                model_update[r0:r1, c0:c1] += commit
+                # Local beam-area residual clean (no convolution); feathered so
+                # tile edges are left for the overlapping neighbour to clean.
+                g = commit > 0
+                sub[g] *= (1.0 - loop_gain * feather[g])
+                sub[pr, pc] *= (1.0 - loop_gain)     # guarantee the tile peak drains
+                commits.append(FlowCommit(cx=float(c0 + tile / 2),
+                                          cy=float(r0 + tile / 2),
+                                          flux=float(commit.sum())))
+                total += 1
+            if total >= max_components:
+                break
+        if total >= max_components:
+            break
+
+    stop_reason = "max_components" if total >= max_components else "tiles_below_threshold"
+    if commits:
+        fluxes = np.array([c.flux for c in commits])
+        print(f"  [flow] passes={len(commits)}  stop={stop:.4g}  "
+              f"flux/pass med/max={np.median(fluxes):.4g}/{fluxes.max():.4g} Jy  "
+              f"total={fluxes.sum():.4g} Jy  stop_reason={stop_reason}")
+
+    return model_update, commits, stop_reason
+
+
+# ---------------------------------------------------------------------------
+# Greedy flow minor cycle (à-la-CLEAN: peak -> flow window -> connected
+# component -> commit -> gated PSF subtraction -> next peak)
+# ---------------------------------------------------------------------------
+
+def minor_cycle_flow_greedy(
+    residual:   np.ndarray,       # (H, W) float32, Jy/beam
+    psf:        np.ndarray,       # (H, W) float32, peak = 1
+    sigma:      float,            # noise estimate (Jy/beam)
+    model,                        # PSFCondFlow
+    *,
+    threshold:    float | None = None,  # peak stop (Jy/beam); default n_sigma_stop*sigma
+    n_sigma_stop: float = 3.0,
+    gain:         float = 0.6,    # fraction of the connected component committed per visit
+    eps_frac:     float = 0.01,   # binarise the flow window at this fraction of its peak
+    n_samples:    int   = 8,
+    n_steps:      int   = 50,
+    tile:         int   = 128,
+    max_components: int = 2000,   # safety cap on greedy iterations
+    image_mask:  np.ndarray | None = None,
+    snapshot_every: int = 0,                 # write a model snapshot every N commits (0=off)
+    snapshot_cb=None,                        # callable(model_update_copy, n_committed)
+    device: str | torch.device = "cpu",
+) -> tuple[np.ndarray, list[FlowCommit], str]:
+    """Greedy CLEAN with the flow as the (extended) component model.
+
+    Per iteration:
+      1. find the residual peak inside the mask;
+      2. crop a `tile`x`tile` window CENTRED on the peak;
+      3. sample the flow (zero conditioning), take the posterior median window;
+      4. DESPECKLE: keep only the connected component of the window that contains
+         the central pixel (the real peak); every disconnected dot the flow
+         painted elsewhere is dropped;
+      5. commit `gain` * component (Jy/pixel) into the model;
+      6. SUBTRACT `gain` * PSF (conv) committed_component from the residual, so the
+         component AND its sidelobes leave and the next true peak emerges.
+    Repeat until the in-mask peak < threshold.  The caller's major cycle re-images
+    exactly (vis-domain), which is the regulariser; `gain` < 1 absorbs per-call
+    flow error before that.
+    """
+    import torch as _torch
+    from scipy.ndimage import label
+    from mad_clean.models.mdn_asp import COND_DIM
+
+    device = _torch.device(device)
+    model.eval()
+    H, W = residual.shape
+    residual = residual.copy().astype(np.float32)
+    model_update = np.zeros((H, W), dtype=np.float32)
+    commits: list[FlowCommit] = []
+
+    stop = threshold if threshold is not None else n_sigma_stop * sigma
+    half = tile // 2
+    zero_cond = _torch.zeros(1, COND_DIM, device=device)
+    psf_cut = _crop_psf_centred(psf, tile)
+    psf_t = _torch.from_numpy(psf_cut).float().to(device)
+
+    from scipy.ndimage import binary_dilation
+    valid = np.ones((H, W), dtype=bool) if image_mask is None else image_mask.astype(bool)
+    done  = np.zeros((H, W), dtype=bool)   # sources already modelled THIS minor cycle
+
+    stop_reason = "peak_below_threshold"
+    while len(commits) < max_components:
+        # peak search excludes the mask AND sources already committed this cycle
+        search = np.where(valid & ~done, residual, -np.inf)
+        pr, pc = np.unravel_index(int(np.argmax(search)), (H, W))
+        peak = float(residual[pr, pc])
+        if peak < stop:
+            stop_reason = "peak_below_threshold"
+            break
+
+        # window centred on the peak
+        r0 = pr - half; c0 = pc - half
+        res_cut = _safe_crop(residual, r0, r0 + tile, c0, c0 + tile)
+
+        img_t = _torch.stack([
+            _torch.from_numpy(res_cut.copy()).float().to(device), psf_t
+        ])[None]                                 # (1, 2, tile, tile)
+        with _torch.no_grad():
+            draws = model.sample(img_t, zero_cond,
+                                 n_samples=n_samples, n_steps=n_steps).squeeze(0)
+            med = draws.median(dim=0).values.cpu().numpy().astype(np.float32)
+
+        wpk = float(med.max())
+        if wpk <= 0:
+            done[pr, pc] = True   # flow predicts nothing here; skip this peak
+            continue
+
+        # --- DESPECKLE: connected component containing the centre ---
+        binary = med > eps_frac * wpk
+        lab, n = label(binary)
+        seed = lab[half, half]
+        if seed == 0:
+            # the real peak isn't where the flow put emission; take the component
+            # nearest the centre (the flow's own brightest blob)
+            seed = lab[np.unravel_index(int(med.argmax()), med.shape)]
+        if seed == 0:
+            done[pr, pc] = True
+            continue
+        component = np.where(lab == seed, med, 0.0).astype(np.float32)
+
+        # --- place component into a full-image increment ---
+        incr = np.zeros((H, W), dtype=np.float32)
+        sr0 = max(0, r0); sr1 = min(H, r0 + tile)
+        sc0 = max(0, c0); sc1 = min(W, c0 + tile)
+        incr[sr0:sr1, sc0:sc1] = component[sr0 - r0:sr1 - r0, sc0 - c0:sc1 - c0]
+        incr = np.where(valid, incr, 0.0).astype(np.float32)
+
+        commit = (gain * incr).astype(np.float32)
+        model_update += commit
+
+        # --- gated PSF subtraction (Cotton-Schwab / Clark) ---
+        residual -= fftconvolve(commit, psf, mode="same").astype(np.float32)
+
+        # --- A: one component per source. Exclude this source's footprint (plus a
+        #        ~beam margin) from the rest of this minor cycle so we never
+        #        revisit it and multiple-count the extended flux. The major cycle
+        #        re-images exactly; the next minor cycle peels it again. ---
+        done |= binary_dilation(incr > 0, iterations=3)
+
+        commits.append(FlowCommit(cx=float(pc), cy=float(pr),
+                                  flux=float(commit.sum())))
+
+        if snapshot_every and snapshot_cb is not None and (len(commits) % snapshot_every == 0):
+            snapshot_cb(model_update.copy(), len(commits))
+    else:
+        stop_reason = "max_components"
+
+    if commits:
+        print(f"  [greedy] components={len(commits)}  stop={stop:.4g}  "
+              f"stop_reason={stop_reason}")
 
     return model_update, commits, stop_reason
 

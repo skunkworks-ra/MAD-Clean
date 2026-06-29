@@ -74,16 +74,43 @@ def _measure_noise_rms(residual: np.ndarray, mask: np.ndarray, n_sigma: float = 
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--vis",    default="/home/pjaganna/Data/imaging/3c391_ctm_mosaic_spw0.ms")
+    p.add_argument("--solver", choices=["mdn", "flow"], default="mdn",
+                   help="Minor-cycle solver: 'mdn' (Aspen Gaussian) or 'flow' "
+                        "(PSFCondFlow pixel window).")
     p.add_argument("--ckpt",   default="results/mdn_asp_v1/best.pt")
+    p.add_argument("--flow_ckpt", default="models/psf_condflow_real.best.pt",
+                   help="PSFCondFlow checkpoint (used when --solver flow).")
+    p.add_argument("--flow_base_channels", type=int,   default=32)
+    p.add_argument("--flow_asinh_a",       type=float, default=1e-2)
+    p.add_argument("--speckle_frac",       type=float, default=0.01,
+                   help="Zero flow-window pixels below this fraction of the "
+                        "window peak (sub-sidelobe speckle cut).")
+    p.add_argument("--conf_k",             type=float, default=3.0,
+                   help="Keep flow pixels with posterior median >= conf_k * MAD "
+                        "across draws (real-emission gate; rejects speckle).")
     p.add_argument("--out_dir", default="results/3c391_mdn_asp")
     p.add_argument("--imsize",  type=int, default=512)
     p.add_argument("--cell",    default="2.5arcsec")
+    p.add_argument("--gridder", default="mosaic",
+                   help="tclean gridder: mosaic | standard | wproject.")
+    p.add_argument("--wprojplanes", type=int, default=-1,
+                   help="w-projection planes (used when --gridder wproject).")
     p.add_argument("--mask_radius_px", type=int, default=200,
                    help="Circular mask radius in pixels from image centre (used if --mask not set).")
     p.add_argument("--mask", type=str, default=None,
                    help="Path to a CASA mask image. Overrides --mask_radius_px for tclean calls.")
     p.add_argument("--loop_gain",   type=float, default=0.1)
     p.add_argument("--max_major",   type=int,   default=20)
+    p.add_argument("--max_minor",   type=int,   default=10000,
+                   help="Max flow passes per minor cycle (tile sweep) — safety cap.")
+    p.add_argument("--tile_stride", type=int,   default=64,
+                   help="Tile-sweep stride in px (tile=128; 64 = 50%% overlap, "
+                        "feathered overlap-add).")
+    p.add_argument("--inner_max",   type=int,   default=3,
+                   help="Flow passes per tile per MAJOR cycle (depth limit). "
+                        "Small = light peel per cycle, major cycles peel deep and "
+                        "correct over-model; large = clean tiles deep in one minor "
+                        "cycle (risks over-commit with the approximate bookkeeping).")
     p.add_argument("--config_idx",  type=int,   default=2,
                    help="VLA config index: 0=A 1=B 2=C 3=D. 3C391 is C-config.")
     p.add_argument("--divergence_tol", type=float, default=0.20,
@@ -310,7 +337,8 @@ def main(argv=None):
             imagename=imgname,
             field='', spw='',
             specmode='mfs',
-            gridder='mosaic',
+            gridder=args.gridder,
+            wprojplanes=args.wprojplanes,
             imsize=[S, S],
             cell=[args.cell, args.cell],
             stokes='I',
@@ -345,13 +373,28 @@ def main(argv=None):
     if not _HAS_CASA:
         raise RuntimeError("MDN imaging loop requires casatasks.")
 
-    # --- load MDN ---
-    ckpt_mdn = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    state = ckpt_mdn.get("model", ckpt_mdn.get("model_state_dict", ckpt_mdn))
-    mdn = MDNAsp(base_channels=32, hidden=256, n_components=5, cond_dim=5)
-    mdn.load_state_dict(state)
-    mdn.to(device).eval()
-    print(f"[img] Loaded MDN checkpoint: {args.ckpt}")
+    # --- load solver model ---
+    if args.solver == "flow":
+        from mad_clean.models.psf_condflow import PSFCondFlow
+        from mad_clean.minor_cycle import minor_cycle_flow
+        ck = torch.load(args.flow_ckpt, map_location="cpu", weights_only=True)
+        cfg = ck.get("config", {})
+        flow = PSFCondFlow(
+            base=cfg.get("base_channels", args.flow_base_channels),
+            asinh_a=cfg.get("asinh_a", args.flow_asinh_a),
+        )
+        flow.load_state_dict(ck["model"])
+        flow.to(device).eval()
+        mdn = None
+        print(f"[img] Loaded PSFCondFlow checkpoint: {args.flow_ckpt} "
+              f"(step {ck.get('step', '?')})")
+    else:
+        ckpt_mdn = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        state = ckpt_mdn.get("model", ckpt_mdn.get("model_state_dict", ckpt_mdn))
+        mdn = MDNAsp(base_channels=32, hidden=256, n_components=5, cond_dim=5)
+        mdn.load_state_dict(state)
+        mdn.to(device).eval()
+        print(f"[img] Loaded MDN checkpoint: {args.ckpt}")
 
     psf_cut  = crop_psf_centred(psf, _PSF_CROP)
 
@@ -387,28 +430,53 @@ def main(argv=None):
     for major in range(args.max_major):
         residual = read_casa_image(imgname + ".residual")
         res_peak = float(np.where(mask, residual, 0.0).max())
-        threshold = max(res_peak * sidelobe_level, noise_floor)
+        # Global stopping criterion, RECOMPUTED each major cycle on the full-image
+        # residual (across all tiles): as cleaning lowers the residual the noise
+        # falls, so 3-sigma falls with it and each major cycle cleans deeper.
+        # (The sidelobe x peak term is NOT used for stopping — noise only.)
+        if args.global_threshold is not None:
+            sigma_rms = args.global_threshold / 3.0
+            threshold = args.global_threshold
+        else:
+            sigma_rms = _measure_noise_rms(residual, mask)
+            threshold = 3.0 * sigma_rms
         print(f"\n[img] Major cycle {major}  residual_peak={res_peak:.4e}  "
-              f"threshold={threshold:.4e}  "
-              f"(psf_floor={res_peak*sidelobe_level:.4e}  noise_floor={noise_floor:.4e})")
+              f"sigma={sigma_rms:.4e}  3-sigma_stop={threshold:.4e}")
 
         if res_peak < threshold:
-            print("[img] Below threshold — stopping.")
+            print("[img] Residual peak below 3-sigma — stopping.")
             break
 
-        # --- MDN minor cycle (peak-centred cutouts, not fixed tile grid) ---
+        # --- minor cycle (peak-centred cutouts, not fixed tile grid) ---
         masked_residual = np.where(mask, residual, 0.0).astype(np.float32)
-        model_update, commits, stop_reason = minor_cycle(
-            residual=masked_residual,
-            psf=psf,
-            sigma=sigma_rms,
-            config_idx=args.config_idx,
-            model=mdn,
-            loop_gain=args.loop_gain,
-            sidelobe_level=sidelobe_level,
-            divergence_tol=args.divergence_tol,
-            device=args.device,
-        )
+        if args.solver == "flow":
+            model_update, commits, stop_reason = minor_cycle_flow(
+                residual=masked_residual,
+                psf=psf,
+                sigma=sigma_rms,
+                model=flow,
+                threshold=threshold,          # this cycle's recomputed 3-sigma
+                loop_gain=args.loop_gain,
+                speckle_frac=args.speckle_frac,
+                conf_k=args.conf_k,
+                stride=args.tile_stride,
+                inner_max=args.inner_max,
+                max_components=args.max_minor,
+                image_mask=mask,
+                device=args.device,
+            )
+        else:
+            model_update, commits, stop_reason = minor_cycle(
+                residual=masked_residual,
+                psf=psf,
+                sigma=sigma_rms,
+                config_idx=args.config_idx,
+                model=mdn,
+                loop_gain=args.loop_gain,
+                sidelobe_level=sidelobe_level,
+                divergence_tol=args.divergence_tol,
+                device=args.device,
+            )
         if not commits:
             print(f"[img] No components accepted (minor_cycle_stop={stop_reason}) — stopping.")
             break
@@ -434,7 +502,8 @@ def main(argv=None):
             imagename=imgname,
             field='', spw='',
             specmode='mfs',
-            gridder='mosaic',
+            gridder=args.gridder,
+            wprojplanes=args.wprojplanes,
             imsize=[S, S],
             cell=[args.cell, args.cell],
             stokes='I',
