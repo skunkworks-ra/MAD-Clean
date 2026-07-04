@@ -190,6 +190,27 @@ def parse_args(argv=None):
     p.add_argument("--device",      type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed",        type=int,   default=42)
+    p.add_argument("--islands",     type=str,   default=None,
+                   help="Train on realistic (T-RECS) island stacks at this dir "
+                        "(dirty.npy/sky.npy/psf.npy/field_id.npy) instead of the "
+                        "synthetic generator. Held-out validation is BY FIELD.")
+    p.add_argument("--init_ckpt",   type=str,   default=None,
+                   help="Warm-start model+EMA from this checkpoint (e.g. the "
+                        "synthetic best.pt). Fine-tune: keeps the localization "
+                        "that transfers; builds morphology+photometry that don't.")
+    p.add_argument("--val_select",  type=str,   default="field",
+                   choices=["field", "extended"],
+                   help="'field': held-out fields (honest). 'extended': rank by "
+                        "central extendedness for visualizing resolved sources "
+                        "(NOT held out — illustrative only).")
+    p.add_argument("--val_fields",  type=int,   default=10,
+                   help="Number of whole fields held out for validation in "
+                        "--islands mode (tests generalization to unseen fields).")
+    p.add_argument("--eval_ckpt",   type=str,   default=None,
+                   help="Held-out eval only: load this checkpoint's weights, run "
+                        "the trusted pixel recon on the fixed held-out set, report "
+                        "rel-L2/flux plus the background speckle floor vs PSF "
+                        "sidelobe, save the val PNG, and exit. Requires --psf_npy.")
     return p.parse_args(argv)
 
 
@@ -211,6 +232,11 @@ def main(argv=None):
     print(f"size={args.size}  batch={args.batch_size}  steps={args.steps}  "
           f"pw_lambda={args.pw_lambda}  asinh_a={args.asinh_a}  "
           f"psf={'corpus:' + args.psf_npy if args.psf_npy else 'g55'}  device={device}")
+
+    if args.init_ckpt is not None:
+        ick = torch.load(args.init_ckpt, map_location=device, weights_only=True)
+        model.load_state_dict(ick["model"])
+        print(f"Warm-started model from {args.init_ckpt} (step {ick.get('step')})")
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -262,8 +288,64 @@ def main(argv=None):
         val_cond = torch.zeros(args.val_size, COND_DIM, device=device)
         print(f"Validation: {args.val_size} held-out scenes, "
               f"{args.val_draws} draws, every {args.val_every} steps (EMA).")
-    elif args.val_every > 0:
+    elif args.val_every > 0 and args.islands is None:
         print("Validation disabled: --psf_npy not set (needs a PSF source).")
+
+    # ── Realistic (T-RECS) island data + held-out-by-FIELD validation ────────
+    isl_imgs = isl_skies = None
+    if args.islands is not None:
+        stacks = Path(args.islands)
+        dirty_np = np.load(stacks / "dirty.npy")             # (N, H, W)
+        sky_np   = np.load(stacks / "sky.npy")               # (N, H, W)
+        psf_np   = np.load(stacks / "psf.npy")               # (F, H, W)
+        fid_np   = np.load(stacks / "field_id.npy")          # (N,)
+        N = dirty_np.shape[0]
+        # 2-channel images = [dirty, field PSF], built once on device.
+        dirty_t = torch.from_numpy(dirty_np).float().to(device)
+        sky_t   = torch.from_numpy(sky_np).float().to(device)
+        psf_t   = torch.from_numpy(psf_np).float().to(device)
+        fid_t   = torch.from_numpy(fid_np).long().to(device)
+        # PSF layout: either one-per-field (indexed by field_id) or already
+        # one-per-window (aligned to dirty).  Detect by matching the first dim.
+        psf_img = psf_t if psf_t.shape[0] == N else psf_t[fid_t]
+        imgs    = torch.stack([dirty_t, psf_img], dim=1)       # (N, 2, H, W)
+
+        # Hold out whole fields (the last val_fields field ids) for validation.
+        uniq = np.unique(fid_np)
+        rng_v = np.random.default_rng(args.seed)
+        val_field_ids = set(rng_v.choice(uniq, size=min(args.val_fields, len(uniq)),
+                                         replace=False).tolist())
+        is_val = np.array([f in val_field_ids for f in fid_np])
+        tr_idx = torch.from_numpy(np.where(~is_val)[0]).to(device)
+        va_idx = torch.from_numpy(np.where(is_val)[0]).to(device)
+
+        # Optional: rank the val set by central extendedness (sum/peak over the
+        # central 48px crop; ~1 for a point, >>1 for resolved structure).  Used
+        # only to VISUALIZE extended reconstruction — note these windows are NOT
+        # held out from training (illustrative of capability, not generalization).
+        if args.val_select == "extended":
+            H0, W0 = sky_np.shape[-2:]
+            h = 24
+            crop = sky_np[:, H0 // 2 - h:H0 // 2 + h, W0 // 2 - h:W0 // 2 + h]
+            csum = crop.reshape(N, -1).sum(1)
+            cpk = crop.reshape(N, -1).max(1).clip(1e-12)
+            ext = csum / cpk
+            va_idx = torch.from_numpy(np.argsort(-ext)).to(device)
+            print(f"Islands: val_select=extended — top central sum/peak = "
+                  f"{ext[np.argsort(-ext)[:3]].round(1).tolist()} (leakage; viz only).")
+
+        isl_imgs  = imgs[tr_idx]
+        isl_skies = sky_t[tr_idx]
+        n_va = min(args.val_size, va_idx.numel())
+        va_sel = va_idx[:n_va]
+        val_img  = imgs[va_sel].detach()
+        val_sky  = sky_t[va_sel].detach()
+        val_cond = torch.zeros(n_va, COND_DIM, device=device)
+        ema_model = PSFCondFlow(base=args.base_channels,
+                                asinh_a=args.asinh_a).to(device)
+        print(f"Islands: {isl_imgs.shape[0]} train / {n_va} val "
+              f"({len(val_field_ids)} held-out fields), "
+              f"{int(fid_t.max())+1} PSFs.")
 
     def validate(step):
         nonlocal best_val
@@ -314,7 +396,157 @@ def main(argv=None):
                 a.axis("off")
         fig.tight_layout()
         fig.savefig(out_path.parent / f"{out_path.stem}_val.png", dpi=110)
+        # Also keep a step-tagged copy so the progression is preserved.
+        prog = out_path.parent / f"{out_path.stem}_val_progression"
+        prog.mkdir(exist_ok=True)
+        fig.savefig(prog / f"step{step:06d}.png", dpi=110)
         plt.close(fig)
+
+    # ── Held-out eval only ──────────────────────────────────────────────────
+    # Load a checkpoint, run the trusted pixel recon on the fixed held-out set,
+    # and additionally quantify the background speckle floor against the PSF
+    # sidelobe level: this is the number that decides whether a simple threshold
+    # cut (below the first sidelobe) cleanly removes the salt-and-pepper floor
+    # without eating faint sources.
+    if args.eval_ckpt is not None:
+        if val_gen is None and isl_imgs is None:
+            raise SystemExit("--eval_ckpt requires --psf_npy (synthetic) or "
+                             "--islands (realistic held-out fields).")
+        ck = torch.load(args.eval_ckpt, map_location=device, weights_only=True)
+        ema_model.load_state_dict(ck["model"])
+        ema_model.eval()
+        with torch.no_grad():
+            draws = ema_model.sample(val_img, val_cond,
+                                     n_samples=args.val_draws, n_steps=50)
+            med = draws.median(dim=1).values                  # (B, H, W)
+            num = (med - val_sky).flatten(1).norm(dim=1)
+            den = val_sky.flatten(1).norm(dim=1).clamp_min(1e-12)
+            rel = (num / den)
+            true_flux = val_sky.flatten(1).sum(1).clamp_min(1e-12)
+            flux = (med.flatten(1).sum(1) / true_flux)
+            # Operational threshold: clear pixels below t * predicted peak (the
+            # cleaned image's own peak, sidelobe-unaware), at 1% — far under the
+            # 27% first sidelobe.  Recompute flux to test the speckle removal.
+            pred_peak = med.flatten(1).max(1).values.clamp_min(1e-12)
+            med_thr = torch.where(med >= 0.01 * pred_peak.view(-1, 1, 1),
+                                  med, torch.zeros_like(med))
+            flux_thr = (med_thr.flatten(1).sum(1) / true_flux)
+
+            # Per-scene true peak and background speckle floor.  Background =
+            # pixels where truth < 1% of that scene's peak.  Floor reported as a
+            # fraction of true peak (99.9th-pct of |median| in the background).
+            true_peak = val_sky.flatten(1).max(1).values.clamp_min(1e-12)   # (B,)
+            bg_mask = val_sky < (0.01 * true_peak.view(-1, 1, 1))
+            big = torch.where(bg_mask, med.abs(), torch.zeros_like(med))
+            bg_floor = torch.quantile(big.flatten(1), 0.999, dim=1)         # (B,)
+            floor_frac = (bg_floor / true_peak)                             # (B,)
+
+        # PSF first-sidelobe level: max of |psf|/peak outside the central beam.
+        # Synthetic uses the single generator PSF; islands use per-field PSFs, so
+        # report the median first-sidelobe across the field PSF bank.
+        if val_gen is not None:
+            psf_bank = val_gen.psf_bank
+            psf_stack = (psf_bank if psf_bank.ndim == 3
+                         else psf_bank.unsqueeze(0)).to(device).float()
+        else:
+            psf_stack = psf_t.to(device).float()              # (F, H, W)
+        H, W = psf_stack.shape[-2:]
+        yy, xx = torch.meshgrid(torch.arange(H, device=device),
+                                torch.arange(W, device=device), indexing="ij")
+        r = ((yy - H // 2) ** 2 + (xx - W // 2) ** 2).sqrt()
+        outer = r > 5
+        psf_n = psf_stack / psf_stack.abs().amax(dim=(-2, -1),
+                                                 keepdim=True).clamp_min(1e-12)
+        sidelobe = float(psf_n.abs()[:, outer].max(dim=1).values.median())
+
+        def _q(x):
+            return (float(torch.quantile(x, 0.25)), float(x.median()),
+                    float(torch.quantile(x, 0.75)))
+        rl, fl, ft, ff = _q(rel), _q(flux), _q(flux_thr), _q(floor_frac)
+        print(f"[eval] ckpt={args.eval_ckpt}  step={ck.get('step', -1)}  "
+              f"n={args.val_size} held-out scenes, {args.val_draws} draws")
+        print(f"[eval] rel_L2(median,truth):  median={rl[1]:.3f}  "
+              f"IQR=[{rl[0]:.3f}, {rl[2]:.3f}]   (lower better)")
+        print(f"[eval] total flux ratio:      median={fl[1]:.3f}  "
+              f"IQR=[{fl[0]:.3f}, {fl[2]:.3f}]  (1.0 = exact)")
+        print(f"[eval] flux ratio @1% thresh: median={ft[1]:.3f}  "
+              f"IQR=[{ft[0]:.3f}, {ft[2]:.3f}]  (speckle removed)")
+        print(f"[eval] speckle floor / peak:  median={ff[1]:.4f}  "
+              f"IQR=[{ff[0]:.4f}, {ff[2]:.4f}]  (background 99.9th pct)")
+        print(f"[eval] PSF first sidelobe:    {sidelobe:.4f} of peak  "
+              f"(threshold below this clears speckle if floor < sidelobe)")
+        verdict = ("CLEAN: speckle floor below sidelobe → a single threshold "
+                   "removes it" if ff[1] < sidelobe else
+                   "OVERLAP: speckle floor >= sidelobe → thresholding risks "
+                   "eating faint real flux")
+        print(f"[eval] verdict: {verdict}")
+
+        # ── Eval figures: linear stretch pinned to truth's peak ─────────────
+        # (log10 flatters the speckle floor; linear shows true recovery.)
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        sky_np  = val_sky.cpu().numpy()
+        med_np  = med.cpu().numpy()
+        dirty_np_ = val_img[:, 0].cpu().numpy()
+        B = sky_np.shape[0]
+        figdir = out_path.parent
+        stem = out_path.stem
+
+        def _panel(a, img, vmin, vmax, cmap):
+            a.imshow(img, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+            a.axis("off")
+
+        # Full-field pages, 4 scenes each: truth | dirty | post median | residual
+        cols = ["truth", "dirty", "post median", "residual (rec−truth)"]
+        per_page = 4
+        n_pages = min(4, (B + per_page - 1) // per_page)
+        for pg in range(n_pages):
+            idx = list(range(pg * per_page, min((pg + 1) * per_page, B)))
+            fig, ax = plt.subplots(len(idx), 4, figsize=(10, 2.5 * len(idx)))
+            ax = np.atleast_2d(ax)
+            for r, i in enumerate(idx):
+                vmax = float(np.clip(sky_np[i].max(), 1e-12, None))
+                resid = med_np[i] - sky_np[i]
+                rlim = vmax
+                _panel(ax[r, 0], sky_np[i], 0.0, vmax, "inferno")
+                _panel(ax[r, 1], dirty_np_[i], None, None, "RdBu_r")
+                _panel(ax[r, 2], med_np[i], 0.0, vmax, "inferno")
+                _panel(ax[r, 3], resid, -rlim, rlim, "RdBu_r")
+                if r == 0:
+                    for k, t in enumerate(cols):
+                        ax[r, k].set_title(t, fontsize=9)
+            fig.tight_layout()
+            p = figdir / f"{stem}_eval_page{pg}.png"
+            fig.savefig(p, dpi=120); plt.close(fig)
+            print(f"[eval] full-field page → {p}")
+
+        # Center zoom-ins on the most complex central sources.  Window is
+        # source-centred; rank scenes by total truth flux inside the central
+        # crop (a proxy for extended/complex central structure), take top 4.
+        H, W = sky_np.shape[-2:]
+        half = 24                                    # 48px central crop
+        cy, cx = H // 2, W // 2
+        csl = (slice(cy - half, cy + half), slice(cx - half, cx + half))
+        central_flux = sky_np[:, csl[0], csl[1]].reshape(B, -1).sum(1)
+        order = np.argsort(-central_flux)[:4]
+        fig, ax = plt.subplots(len(order), 3, figsize=(7.5, 2.5 * len(order)))
+        ax = np.atleast_2d(ax)
+        zcols = ["truth (center)", "post median (center)", "residual"]
+        for r, i in enumerate(order):
+            t = sky_np[i][csl]; m = med_np[i][csl]
+            vmax = float(np.clip(t.max(), 1e-12, None))
+            _panel(ax[r, 0], t, 0.0, vmax, "inferno")
+            _panel(ax[r, 1], m, 0.0, vmax, "inferno")
+            _panel(ax[r, 2], m - t, -vmax, vmax, "RdBu_r")
+            if r == 0:
+                for k, tt in enumerate(zcols):
+                    ax[r, k].set_title(tt, fontsize=9)
+        fig.tight_layout()
+        pz = figdir / f"{stem}_eval_zoom.png"
+        fig.savefig(pz, dpi=130); plt.close(fig)
+        print(f"[eval] center zoom → {pz}")
+        return
 
     model.train()
     t0 = time.time()
@@ -344,10 +576,19 @@ def main(argv=None):
         if step % args.checkpoint_every == 0:
             save(step)
             print(f"  checkpoint → {out_path}  (step {step})")
-        if val_gen is not None and step % args.val_every == 0:
+        if val_img is not None and step % args.val_every == 0:
             validate(step)
 
-    if args.gpu_gen:
+    if args.islands is not None:
+        # Sample random minibatches from the device-resident real islands.
+        n_tr = isl_imgs.shape[0]
+        ib_gen = torch.Generator(device=device).manual_seed(args.seed + 7)
+        while step < args.steps:
+            sel = torch.randint(0, n_tr, (args.batch_size,),
+                                device=device, generator=ib_gen)
+            step += 1
+            train_step(isl_imgs[sel], isl_skies[sel][:, None])
+    elif args.gpu_gen:
         # On-GPU generation: no DataLoader, no CPU workers.
         if args.psf_npy is None:
             raise SystemExit("--gpu_gen requires --psf_npy (corpus PSF stack).")

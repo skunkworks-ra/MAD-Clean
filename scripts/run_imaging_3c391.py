@@ -85,6 +85,13 @@ def parse_args(argv=None):
     p.add_argument("--speckle_frac",       type=float, default=0.01,
                    help="Zero flow-window pixels below this fraction of the "
                         "window peak (sub-sidelobe speckle cut).")
+    p.add_argument("--floor_frac",         type=float, default=0.05,
+                   help="PRE-rescale amplitude cut in normalised flow space: zero "
+                        "every pixel below this fraction of the per-draw normalised "
+                        "peak BEFORE multiplying by the window peak. Kills the "
+                        "constant relative floor at a consistent level across "
+                        "windows (symmetric) so the rescale can't amplify it into "
+                        "speckle and seams.")
     p.add_argument("--conf_k",             type=float, default=3.0,
                    help="Keep flow pixels with posterior median >= conf_k * MAD "
                         "across draws (real-emission gate; rejects speckle).")
@@ -459,6 +466,7 @@ def main(argv=None):
                 loop_gain=args.loop_gain,
                 speckle_frac=args.speckle_frac,
                 conf_k=args.conf_k,
+                floor_frac=args.floor_frac,
                 stride=args.tile_stride,
                 inner_max=args.inner_max,
                 max_components=args.max_minor,

@@ -235,6 +235,7 @@ class PSFCondFlow(nn.Module):
         cond: torch.Tensor,     # (B, cond_dim) or (cond_dim,)
         n_samples: int = 8,
         n_steps: int = 50,
+        floor_frac: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Draw posterior samples. Returns (B, n_samples, H, W) non-negative.
@@ -242,6 +243,14 @@ class PSFCondFlow(nn.Module):
         The ODE runs in flux-normalised space (s / dirty_peak) so the signal
         is O(1) and matches the N(0,1) initial noise.  Output is rescaled to
         physical Jy/pixel before returning.
+
+        floor_frac: if > 0, zero every pixel below this fraction of the
+        per-draw normalised peak BEFORE rescaling by the window peak.  The
+        flow hedges low-SNR windows with a near-constant relative floor
+        (~2% of peak); masking it pre-rescale removes it at a single
+        consistent relative level across all windows (symmetric), so the
+        per-window rescale no longer amplifies it into absolute speckle and
+        neighbouring windows stop depositing mismatched floors (seams).
 
         For a single observation (B=1 or unbatched), the leading dim is
         squeezed: returns (n_samples, H, W).
@@ -273,7 +282,13 @@ class PSFCondFlow(nn.Module):
             )
             x = x + dt * self.velocity(x, t_val, ctx, cmaps)
 
-        s = torch.relu(self._from_y(x)) * fscale               # inv-transform, Jy
+        s_norm = torch.relu(self._from_y(x))                   # normalised, >=0
+        if floor_frac > 0.0:
+            # per-draw peak over (H, W); zero everything below floor_frac of it
+            pk = s_norm.amax(dim=(-2, -1), keepdim=True)       # (B*n, 1, 1, 1)
+            s_norm = torch.where(s_norm >= floor_frac * pk, s_norm,
+                                 torch.zeros_like(s_norm))
+        s = s_norm * fscale                                    # inv-transform, Jy
         return s.view(B, n_samples, H, W).squeeze(0) if squeeze else s.view(B, n_samples, H, W)
 
 

@@ -276,6 +276,7 @@ def minor_cycle_flow(
     n_sigma_stop: float = 3.0,
     speckle_frac:    float = 0.01,
     conf_k:          float = 3.0,    # keep pixels with median >= conf_k * MAD(draws)
+    floor_frac:      float = 0.05,   # PRE-rescale cut inside sample() (normalised space)
     n_samples:       int   = 8,
     n_steps:         int   = 50,
     tile:            int   = 128,
@@ -342,7 +343,8 @@ def minor_cycle_flow(
                 ])[None]                             # (1, 2, tile, tile)
                 with _torch.no_grad():
                     draws = model.sample(img_t, zero_cond,
-                                         n_samples=n_samples, n_steps=n_steps).squeeze(0)
+                                         n_samples=n_samples, n_steps=n_steps,
+                                         floor_frac=floor_frac).squeeze(0)
                     med = draws.median(dim=0).values
                     mad = 1.4826 * (draws - med).abs().median(dim=0).values
                     wpk = float(med.max())
